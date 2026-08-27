@@ -36,14 +36,36 @@ from typing import Any, Dict, Optional
 from ..models import Business, Cost, Signal
 from . import Context, signal
 
-# Selenium is an optional extra. Import failure is a state to report, not a
-# crash at import time -- the other thirteen signals must still work.
-try:                                            # pragma: no cover - env dependent
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    HAVE_SELENIUM = True
-except Exception:                               # noqa: BLE001
-    HAVE_SELENIUM = False
+def _selenium():
+    """Import selenium only when a browser is actually about to be opened.
+
+    It was imported at module load, and because the signal registry imports
+    every signal module, that meant a pure-HTTP run pulled the whole browser
+    stack into memory to do nothing with it. The core has two dependencies; it
+    should not load a third to collect over HTTP.
+    """
+    from selenium import webdriver                          # noqa: PLC0415
+    from selenium.webdriver.chrome.options import Options   # noqa: PLC0415
+    return webdriver, Options
+
+
+def _have_selenium() -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec("selenium") is not None
+    except Exception:                           # noqa: BLE001
+        return False
+
+
+class _Lazy:
+    """`detail.HAVE_SELENIUM` stays a truthy attribute without importing."""
+    def __bool__(self):
+        return _have_selenium()
+    def __repr__(self):
+        return repr(_have_selenium())
+
+
+HAVE_SELENIUM = _Lazy()
 
 INSTALL_HINT = ('needs a browser: pip install "kerb[browser]"')
 
@@ -82,6 +104,7 @@ def _driver(profile):
     with _LOCK:
         if _DRIVER is not None:
             return _DRIVER
+        webdriver, Options = _selenium()
         opts = Options()
         opts.add_argument("--headless=new")
         opts.add_argument("--window-size=1400,1000")
@@ -158,9 +181,20 @@ def reviews_live(biz: Business, ctx: Context) -> Signal:
 
     n = _count(text)
     if n is None:
+        # Distinguish "no reviews tab" from "count not found". The predecessor
+        # called the first one the LIMITED VIEW and it has a specific cause and
+        # a specific fix; reporting a vague maybe sends people hunting.
+        limited = "Reviews" not in text
         return Signal("reviews_live", None, 0.0,
-                      {"error": "no review count on the page -- Google may be "
-                                "serving a signed-out view (see `kerb setup "
-                                "--import-cookies`)"})
+                      {"error": ("Google served the signed-out view of this "
+                                 "place: rating shown, no Reviews tab, no count. "
+                                 "Sign the profile in once with `kerb setup "
+                                 "--import-cookies FILE`."
+                                 if limited else
+                                 "a Reviews tab is present but no count could be "
+                                 "read from it -- the page layout may have moved"),
+                       "limited_view": limited,
+                       "tabs_seen": [t for t in ("Overview", "Reviews", "About",
+                                                 "Photos") if t in text]})
     return Signal("reviews_live", n, 1.0,
                   {"source": "maps place page", "url": url})

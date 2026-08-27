@@ -910,6 +910,87 @@ def cmd_setup(args) -> int:
     return 0
 
 
+def cmd_reviews(args) -> int:
+    """Reviews for a run that already exists. Deliberately a SECOND step.
+
+    Normal Kerb never opens a browser. Reviews are the one thing that needs
+    one -- the request cannot be synthesised -- and most runs do not want them,
+    so this is opt-in and runs over the businesses that QUALIFIED rather than
+    everything discovery happened to find.
+    """
+    import json as _json
+    from .reviews import HarvestError, harvest
+    from .signals import detail
+    from .store import Store
+
+    if not detail.HAVE_SELENIUM:
+        say(C.bad("reviews need a browser"))
+        say('  pip install "kerb[browser]"')
+        return 1
+
+    store = Store()
+    if store.get_run(args.run) is None:
+        say(C.bad("no run %r in the ledger" % args.run))
+        say("  `kerb jobs` lists what is there")
+        return 1
+
+    rows = [r for r in store.results(args.run)
+            if args.all or (r.get("outcome") == "qualified")]
+    rows = [r for r in rows if (r.get("extras") or {}).get("maps_url")
+            or str(r.get("cid") or "").startswith("0x")]
+    if args.limit:
+        rows = rows[:args.limit]
+    if not rows:
+        say(C.bad("nothing to harvest"))
+        say("  the run has no qualified businesses carrying a Maps id"
+            + ("" if args.all else " (try --all)"))
+        return 1
+
+    out_path = Path(args.out or ("reviews-%s.jsonl" % args.run))
+    say(C.bold("harvesting reviews"), C.dim("%d business(es) -> %s" % (len(rows), out_path)))
+    say(C.dim("  one browser, reused; the request is captured once per place"))
+
+    total, failed = 0, 0
+    from .session import Profile
+    drv = detail._driver(Profile.load())
+    try:
+        with out_path.open("w") as fh:
+            for i, r in enumerate(rows, 1):
+                url = ((r.get("extras") or {}).get("maps_url")
+                       or _maps_url(str(r.get("cid") or "")))
+                name = (r.get("name") or r.get("cid") or "?")[:38]
+                try:
+                    got = harvest(drv, url, max_reviews=args.max_reviews)
+                except HarvestError as exc:
+                    failed += 1
+                    say(" ", C.bad("%-40s" % name), C.dim(str(exc)[:60]))
+                    continue
+                for rev in got:
+                    rev["cid"] = r.get("cid")
+                    rev["business"] = r.get("name")
+                    fh.write(_json.dumps(rev) + "\n")
+                total += len(got)
+                say(" ", C.good("%-40s" % name), C.dim("%d reviews" % len(got)))
+    finally:
+        # The predecessor's worst failure was a driver outliving its run.
+        detail.close()
+
+    say("")
+    say("  %d review(s) from %d business(es)%s"
+        % (total, len(rows) - failed,
+           ", %d could not be read" % failed if failed else ""))
+    say("  ->", C.bold(str(out_path)))
+    return 0 if total else 1
+
+
+def _maps_url(cid: str) -> str:
+    """`0xAAA:0xBBB` -> the maps.google.com/?cid= link the RPC needs."""
+    try:
+        return "https://www.google.com/maps?cid=%d" % int(cid.split(":")[1], 16)
+    except (IndexError, ValueError):
+        return "https://www.google.com/maps?q=%s" % cid
+
+
 def cmd_doctor(args) -> int:
     """Is this install healthy, and is anything left running from last time."""
     import importlib
@@ -1237,6 +1318,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "line, exported from a browser already signed in to "
                          "Google. Unlocks the full Maps view.")
     su.set_defaults(fn=cmd_setup)
+
+    rv = sub.add_parser("reviews",
+                        help="harvest reviews for a finished run (opt-in, needs a browser)")
+    rv.add_argument("run", help="run id, from `kerb jobs`")
+    rv.add_argument("--out", help="where to write them (default reviews-<run>.jsonl)")
+    rv.add_argument("--limit", type=int, help="max businesses to harvest")
+    rv.add_argument("--max-reviews", type=int, default=None,
+                    help="stop after this many reviews per business")
+    rv.add_argument("--all", action="store_true",
+                    help="every business in the run, not just the qualified ones")
+    rv.set_defaults(fn=cmd_reviews)
 
     sub.add_parser("doctor", help="check this install").set_defaults(fn=cmd_doctor)
     st = sub.add_parser("stop", help="kill everything kerb started")
