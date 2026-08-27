@@ -8,7 +8,7 @@ No API key. No browser. No other scraper. And when it can't measure something, i
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-000000.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-170%20passing-2C6A4F.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-172%20passing-2C6A4F.svg)](tests/)
 [![Dependencies](https://img.shields.io/badge/dependencies-2-8A5E23.svg)](pyproject.toml)
 [![Self-hosted](https://img.shields.io/badge/data-never%20leaves%20your%20machine-19C9E6.svg)](#legal)
 
@@ -63,37 +63,150 @@ about a business.
 
 | If you want to… | Go here |
 |---|---|
-| See it work in 60 seconds | [Quick start](#quick-start) |
-| Scrape Google Maps for a trade | [Collecting from Google Maps](#collecting-from-google-maps) |
-| Qualify a CSV you already have | [Quick start → a file you already have](#a-file-you-already-have) |
+| Install it and get collecting | [Setup](#setup) |
+| Scrape Google Maps for a trade | [Your first run](#your-first-run) |
+| Qualify a CSV you already have | [From a file you already have](#from-a-file-you-already-have) |
 | Understand what it measures | [What it measures](#what-it-measures) |
 | Write a brief by hand and schedule it | [The brief](#the-brief) |
+| Know why reviews are missing | [Signed out vs signed in](#signed-out-vs-signed-in--read-this-bit) |
 | Not get blocked | [Staying unblocked](#staying-unblocked) |
 | Know what it *can't* do | [What Kerb does not do](#what-kerb-does-not-do) |
 
 ---
 
-## Quick start
+## Setup
+
+Three commands, and the third one is the app.
 
 ```bash
-pip install kerb[server]
-kerb setup            # one-off: creates the browsing profile
-kerb                  # opens the UI
+pip install "kerb[server]"
+kerb setup
+kerb
 ```
 
-That's it. No account, no API key, no Docker, no Chrome. Two dependencies:
-`httpx` and `PyYAML`.
+No Docker. No Chrome. No chromedriver. No API key. No account.
+Two dependencies: `httpx` and `PyYAML`.
 
-### Collecting from Google Maps
+### What `kerb setup` actually does
+
+It builds a **browsing profile** — a persistent identity Kerb collects with, so
+a thousand requests look like one person rather than a thousand strangers. It
+stores a user agent, a locale, Google's consent choice, and any cookies you give
+it, at `~/.kerb/session.json`, mode `0600`.
+
+Then it **proves the profile works before saving it**. A setup that writes a file
+and declares success leaves the first real run to discover the problem, forty
+places in.
+
+```
+$ kerb setup --gl uk
+
+saved  ~/.kerb/session.json
+       3 cookie(s), locale en/uk, created 0s ago
+       signed in to Google: NO -- Google serves a reduced view of Maps
+```
+
+> **`--gl` matters more than it looks.** It decides which Google you get.
+> `--gl uk` and `--gl us` return different businesses for the same query.
+
+### Signed out vs signed in — read this bit
+
+This is the one thing that will confuse you if nobody says it:
+
+> **Google serves signed-out clients a reduced view of Maps.**
+
+Signed out, everything below still arrives in full:
+
+| Collected signed out | |
+|---|---|
+| ✅ name, category, address | ✅ phone, website |
+| ✅ rating, coordinates | ✅ the Google CID (identity) |
+| ❌ **review counts** | |
+
+That last row is not cosmetic. Kerb's `reviews` condition is on by default at
+`>= 30`, and with no counts every business lands in **never found out** — correct,
+because Kerb will not invent a measurement, but useless as a filter. The UI
+notices and offers `rating_band` instead, which *is* collected.
+
+**To lift the limit, hand Kerb a signed-in session — once.**
+
+<details>
+<summary><b>How to export your Google cookies</b> (click to open)</summary>
+
+Kerb never asks for a password and never opens a browser. You export cookies
+from a browser that is *already* signed in, and hand them over once.
+
+**Option A — a cookie-export extension (easiest)**
+
+1. Sign in to Google in your normal browser.
+2. Install any "cookies.txt" export extension.
+3. Visit `google.com`, export, save the file.
+4. `kerb setup --import-cookies ~/Downloads/cookies.txt`
+
+**Option B — DevTools, no extension**
+
+1. Sign in to Google, open `google.com`.
+2. DevTools → **Network** → click any request → **Copy → Copy as cURL**.
+3. Paste into a file and keep only the `Cookie:` line:
+   ```
+   Cookie: SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...
+   ```
+4. `kerb setup --import-cookies that-file.txt`
+
+Kerb accepts all three shapes browsers export — Netscape `cookies.txt`, a JSON
+array, or a raw `Cookie:` header — because being told "wrong format" is a
+terrible first experience.
+
+```
+$ kerb setup --import-cookies ~/Downloads/cookies.txt
+
+read 6 cookie(s) from cookies.txt: APISID, HSID, SAPISID, SID, SSID, __Secure-1PSID
+saved  ~/.kerb/session.json
+       signed in to Google: yes
+
+Signed in. You get the full Maps view.
+```
+
+Only cookie **names** are ever printed. A cookie value is a credential and does
+not belong in a terminal, a scrollback buffer, or a screenshot of one.
+
+</details>
+
+**Check it any time:**
+
+```bash
+kerb setup --check
+```
+
+```
+profile: ~/.kerb/session.json
+         6 cookie(s), locale en/uk, created 2d ago
+         signed in to Google: yes
+
+working, signed in. `kerb serve` and pick Google Maps.
+```
+
+If a run ever comes back thinner than you expect, this is the first thing to run.
+Kerb also drops a note into the run itself rather than letting you wonder.
+
+### Why cookies and not a Chrome profile?
+
+Because a browser is the thing that breaks.
+
+The tool Kerb replaces drove a real Chrome through a driver and kept a profile
+directory. It worked — and every crashed run left a `chromedriver` and its Chrome
+children behind. Enough of them filled a disk. Kerb launches **no process at
+all**, so there is nothing to leak, nothing to install, and nothing to keep
+updated. The cookies carry the same session the profile did.
+
+---
+
+## Your first run
+
+### From Google Maps
 
 Pick **Google Maps** as the source, type any trade, list your places, press Run.
-
-```bash
-kerb setup --gl uk    # region matters: it decides which Google you get
-kerb serve
-```
-
-Or headless, from a file:
+Or headless:
 
 ```yaml
 # cafes.yaml
@@ -119,7 +232,7 @@ $ kerb run cafes.yaml --out leads.csv
   -> leads.csv (9 rows, csv)
 ```
 
-### A file you already have
+### From a file you already have
 
 Already scraped Maps with something else? Kerb qualifies any CSV, JSON or JSONL:
 
@@ -127,9 +240,9 @@ Already scraped Maps with something else? Kerb qualifies any CSV, JSON or JSONL:
 sources: [{id: csv, options: {path: exported.csv}}]
 ```
 
-It auto-detects the column layout and tells you what it mapped and what it didn't.
-The Google CID is the identity key, so businesses collected by Kerb and imported
-from a file **deduplicate against each other for free**.
+It auto-detects the column layout and tells you what it mapped and what it
+didn't. The Google CID is the identity key, so businesses collected by Kerb and
+imported from a file **deduplicate against each other for free**.
 
 ---
 
@@ -298,7 +411,7 @@ kerb setup --check     # is the profile working? am I cooling down?
 | Command | Does |
 |---|---|
 | `kerb` | Opens the UI |
-| `kerb setup` | Creates the browsing profile (`--check` to verify it) |
+| `kerb setup` | Builds the browsing profile. `--check` verifies it, `--import-cookies` signs it in |
 | `kerb run brief.yaml` | Runs headless, writes CSV / JSON / JSONL |
 | `kerb estimate brief.yaml` | What it *would* do, without doing it |
 | `kerb requalify <run>` | Re-judge a stored run with today's packs and rules — no re-collection |
@@ -315,10 +428,11 @@ disk filled. Kerb launches none — but it still checks.
 
 Every project has these. Most hide them.
 
-- **Review counts from Google Maps.** The search endpoint returns a rating but not a
-  count. Kerb does **not** invent one: a guessed count silently changes every score.
-  With `gmaps` as your source the UI blocks a review-count condition up front and
-  offers `rating_band` instead, which *is* collected.
+- **Review counts, signed out.** Google serves signed-out clients a reduced view
+  of Maps. Kerb does **not** invent a count — a guessed one silently changes every
+  score — so it reports those businesses as *never found out* and the UI offers
+  `rating_band` instead. [Sign in once](#signed-out-vs-signed-in--read-this-bit)
+  and the limit lifts.
 - **Synonyms.** A typed trade matches by substring, so `cafes` will not find
   "Coffee shop" until you add `coffee` to the keywords. Google knows they're
   synonyms; a string matcher doesn't.

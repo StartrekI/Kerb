@@ -847,24 +847,66 @@ def cmd_setup(args) -> int:
         print("profile: %s" % rep["profile"])
         print("         %s" % rep["detail"])
         if rep["ok"]:
-            print("\nworking. `kerb serve` and pick Google Maps as the source.")
+            if not rep.get("signed_in"):
+                print("\nworking, but SIGNED OUT. Google serves signed-out clients a")
+                print("reduced view of Maps -- listings come through, review data does")
+                print("not. To fix it, see `kerb setup --help` (--import-cookies).")
+            else:
+                print("\nworking, signed in. `kerb serve` and pick Google Maps.")
             return 0
         print("\nnot working: %s" % rep["problem"])
         print("run `kerb setup` to rebuild it.")
         return 1
 
+    cookies = None
+    if args.import_cookies:
+        from .session import parse_cookies
+        src = Path(args.import_cookies).expanduser()
+        if not src.exists():
+            print("no such file: %s" % src)
+            return 1
+        try:
+            cookies = parse_cookies(src.read_text())
+        except SetupError as exc:
+            print("could not read cookies: %s" % exc)
+            return 1
+        # NAMES only. A cookie value is a credential and does not belong in a
+        # terminal, a scrollback buffer, or a screenshot of one.
+        print("read %d cookie(s) from %s: %s\n"
+              % (len(cookies), src.name, ", ".join(sorted(cookies)[:8])))
+
     print("Creating a browsing profile for the Google Maps collector.")
-    print("No account and no password are involved -- Kerb reads public")
-    print("business listings, which needs neither.\n")
+    if not cookies:
+        print("No account and no password are involved. Kerb reads public")
+        print("business listings, which needs neither -- but see the note at")
+        print("the end about what a signed-out session does not get.\n")
     try:
-        prof = setup(hl=args.hl, gl=args.gl)
+        prof = setup(hl=args.hl, gl=args.gl, cookies=cookies)
     except SetupError as exc:
         print("setup failed: %s" % exc)
         return 1
     print("saved  %s" % prof.path)
     print("       %s" % prof.describe())
-    print("\nReady. Start the UI with `kerb serve` and choose Google Maps")
-    print("as the source, or run a campaign with sources: [{id: gmaps}].")
+
+    if prof.signed_in:
+        print("\nSigned in. You get the full Maps view.")
+    else:
+        print("\n" + "-" * 68)
+        print("SIGNED OUT -- this still works, with one limit.")
+        print("Google serves signed-out clients a reduced view of Maps.")
+        print("Listings come through in full (name, category, address, phone,")
+        print("website, rating, coordinates); review data does not.")
+        print("")
+        print("To lift it, export cookies from a browser already signed in to")
+        print("Google and hand them to Kerb once:")
+        print("")
+        print("    kerb setup --import-cookies ~/Downloads/cookies.txt")
+        print("")
+        print("They are stored in your profile at 0600 and never leave the")
+        print("machine. Kerb never asks for a password.")
+        print("-" * 68)
+    print("\nReady. `kerb serve` and choose Google Maps, or run a campaign")
+    print("with sources: [{id: gmaps}].")
     return 0
 
 
@@ -1182,6 +1224,10 @@ def build_parser() -> argparse.ArgumentParser:
     su.add_argument("--gl", default="us", help="region, e.g. uk, de (default us)")
     su.add_argument("--check", action="store_true",
                     help="only report whether the existing profile still works")
+    su.add_argument("--import-cookies", metavar="FILE", dest="import_cookies",
+                    help="a cookies.txt, JSON cookie export, or a Cookie: header "
+                         "line, exported from a browser already signed in to "
+                         "Google. Unlocks the full Maps view.")
     su.set_defaults(fn=cmd_setup)
 
     sub.add_parser("doctor", help="check this install").set_defaults(fn=cmd_doctor)

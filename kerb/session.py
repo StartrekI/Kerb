@@ -71,6 +71,11 @@ class Profile:
         self.blocked_at: float = float(d.get("blocked_at") or 0.0)
         self.cooldown_until: float = float(d.get("cooldown_until") or 0.0)
         self.blocks: int = int(d.get("blocks") or 0)
+        # Whether the last check saw a SIGNED-IN Google. Google serves
+        # signed-out clients a reduced view of Maps, so this is the difference
+        # between a full listing and a partial one -- and the user has to be
+        # told which one they are getting.
+        self.signed_in: bool = bool(d.get("signed_in") or False)
 
     # -- persistence ------------------------------------------------------
 
@@ -89,7 +94,8 @@ class Profile:
         body = {"user_agent": self.user_agent, "locale": self.locale,
                 "cookies": self.cookies, "created": self.created or time.time(),
                 "checked": self.checked, "blocked_at": self.blocked_at,
-                "cooldown_until": self.cooldown_until, "blocks": self.blocks}
+                "cooldown_until": self.cooldown_until, "blocks": self.blocks,
+                "signed_in": self.signed_in}
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(body, indent=2))
         os.replace(tmp, self.path)              # atomic: never a half-written jar
@@ -146,6 +152,9 @@ class Profile:
         base = ("%d cookie(s), locale %s/%s, created %s ago"
                 % (len(self.cookies), self.locale.get("hl"), self.locale.get("gl"),
                    _ago(age)))
+        base += ("\n         signed in to Google: %s"
+                 % ("yes" if self.signed_in
+                    else "NO -- Google serves a reduced view of Maps"))
         cool = self.cooling()
         if cool:
             base += ("\n         COOLING DOWN for another %s after %d block(s)"
@@ -160,12 +169,86 @@ def _ago(sec: float) -> str:
     return "%ds" % sec
 
 
+def parse_cookies(text: str) -> Dict[str, str]:
+    """Cookies out of whatever a browser gave you.
+
+    Three formats, because people export from three different places and being
+    told "wrong format" is a terrible first experience:
+
+      * Netscape cookies.txt   -- what browser extensions export
+      * a JSON array           -- what devtools and EditThisCookie export
+      * a raw Cookie: header   -- what you get from Copy as cURL
+
+    Values are never logged or printed anywhere; only names are ever shown.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {}
+    out: Dict[str, str] = {}
+
+    if text.lstrip().startswith(("[", "{")):
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise SetupError("that file is not valid JSON: %s" % exc)
+        items = data if isinstance(data, list) else [data]
+        for c in items:
+            if isinstance(c, dict) and c.get("name"):
+                out[str(c["name"])] = str(c.get("value", ""))
+        if out:
+            return out
+
+    if "\t" in text or text.lstrip().startswith("# Netscape"):
+        for line in text.splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            bits = line.split("\t")
+            if len(bits) >= 7:
+                out[bits[5].strip()] = bits[6].strip()
+        if out:
+            return out
+
+    # A raw header: "SID=abc; HSID=def; SSID=ghi"
+    for part in text.replace("Cookie:", "", 1).split(";"):
+        if "=" in part:
+            k, _, v = part.partition("=")
+            k = k.strip()
+            if k:
+                out[k] = v.strip()
+    if not out:
+        raise SetupError(
+            "no cookies found in that file. Expected a Netscape cookies.txt, a "
+            "JSON export, or a line like `SID=...; HSID=...`.")
+    return out
+
+
+# Cookies Google sets only for a signed-in session. Presence is a strong hint;
+# the live check below is what actually decides.
+SIGNED_IN_HINTS = ("SID", "SSID", "HSID", "APISID", "SAPISID", "__Secure-1PSID")
+
+
 class SetupError(RuntimeError):
     """Setup could not produce a working profile, and says which part failed."""
 
 
+def looks_signed_in(body: str) -> bool:
+    """Did Google answer as if somebody is signed in?
+
+    Mirrors the check the predecessor scraper made in the browser. A signed-out
+    client is served a reduced Maps -- their code called it the "limited view"
+    -- with no reviews. Detecting it is the difference between a partial run
+    and a partial run nobody was told about.
+    """
+    head = body[:200000]
+    if 'aria-label="Google Account' in head or '"gaia_' in head:
+        return True
+    # A prominent Sign in affordance means we are not.
+    return not (">Sign in<" in head or 'aria-label="Sign in"' in head)
+
+
 def setup(hl: str = "en", gl: str = "us", timeout: float = 25.0,
-          path: Optional[Path] = None) -> Profile:
+          path: Optional[Path] = None,
+          cookies: Optional[Dict[str, str]] = None) -> Profile:
     """Create a profile and prove it can actually reach listings.
 
     Proving it is the point. A setup that writes a file and declares success
@@ -177,6 +260,8 @@ def setup(hl: str = "en", gl: str = "us", timeout: float = 25.0,
     # Record the consent choice before the first request, so an EU IP is not
     # handed an interstitial instead of results.
     prof.cookies[CONSENT_COOKIE] = CONSENT_VALUE
+    if cookies:
+        prof.cookies.update(cookies)
 
     with httpx.Client(follow_redirects=True, timeout=timeout,
                       headers=prof.headers(), cookies=prof.cookies) as client:
@@ -192,6 +277,8 @@ def setup(hl: str = "en", gl: str = "us", timeout: float = 25.0,
                 "Google answered with its consent page and would not set a "
                 "session. This usually clears by running `kerb setup` again "
                 "from the same network, or by choosing a different --gl region.")
+
+        prof.signed_in = looks_signed_in(r.text)
 
     prof.checked = time.time()
     prof.save()
@@ -227,6 +314,9 @@ def check(prof: Optional[Profile] = None, timeout: float = 25.0) -> Dict[str, An
             out["problem"] = "google.com answered %s" % r.status_code
         else:
             out["ok"] = True
+            prof.signed_in = looks_signed_in(r.text)
+            prof.save()
+        out["signed_in"] = prof.signed_in
     except httpx.HTTPError as exc:
         out["problem"] = "could not reach google.com: %s" % exc
     return out

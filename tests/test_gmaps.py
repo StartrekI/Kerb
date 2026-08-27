@@ -288,9 +288,57 @@ def test_profile_round_trips_and_is_private(tmp=Path("/tmp/kerb-gmaps-test.json"
     print("  profile round-trips          ok")
 
 
+def test_cookie_import_accepts_what_browsers_actually_export():
+    """Three formats, because people export from three different places and
+    being told "wrong format" is a terrible first experience."""
+    from kerb.session import parse_cookies
+    header = parse_cookies("Cookie: SID=abc; HSID=def; SSID=ghi")
+    assert header == {"SID": "abc", "HSID": "def", "SSID": "ghi"}, header
+
+    js = parse_cookies('[{"name":"SID","value":"abc"},{"name":"HSID","value":"d"}]')
+    assert js == {"SID": "abc", "HSID": "d"}, js
+
+    nets = parse_cookies("# Netscape HTTP Cookie File\n"
+                         ".google.com\tTRUE\t/\tTRUE\t0\tSID\tabc\n"
+                         ".google.com\tTRUE\t/\tTRUE\t0\tHSID\tdef\n")
+    assert nets == {"SID": "abc", "HSID": "def"}, nets
+
+    for junk in ("", "   ", "no cookies here at all"):
+        try:
+            got = parse_cookies(junk)
+        except session.SetupError:
+            continue
+        assert got == {}, got
+    print("  cookie formats parsed        ok")
+
+
+def test_signed_out_is_detected_and_said_out_loud():
+    """Google serves signed-out clients a reduced view of Maps. A run that
+    quietly returns less is the failure this project keeps removing."""
+    from kerb.session import looks_signed_in
+    assert looks_signed_in('<div aria-label="Google Account: Sam"></div>')
+    assert not looks_signed_in('<a href="/login" aria-label="Sign in">x</a>')
+    assert not looks_signed_in("<span>Sign in</span>")
+
+    _fresh_profile()
+    prof = session.Profile({}, TEST_PROFILE)
+    prof.created = 1.0
+    prof.signed_in = False
+    prof.save()
+    q = SourceQuery(what="dentist", places=["Islington"], options={"pause": 0})
+    drive(q, lambda r: httpx.Response(200, text=FIXTURE))
+    notes = " ".join(q.report.get("notes") or [])
+    assert "signed out" in notes.lower(), q.report
+    assert "review data" in notes.lower(), q.report
+    _fresh_profile()
+    print("  signed-out state reported    ok")
+
+
 if __name__ == "__main__":
     print("gmaps -- the collector Kerb runs itself\n")
     for fn in (test_parses_a_real_response,
+               test_cookie_import_accepts_what_browsers_actually_export,
+               test_signed_out_is_detected_and_said_out_loud,
                test_review_count_is_absent_not_invented,
                test_a_moved_shape_raises_instead_of_returning_nothing,
                test_a_web_page_is_a_block_not_a_parse_error,

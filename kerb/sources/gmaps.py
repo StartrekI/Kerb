@@ -296,6 +296,16 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
             "another %s. Re-run after that, or lower the worker count first. "
             "(`kerb setup --check` shows the remaining time.)" % _ago(cool))
 
+    if not prof.exists:
+        q.report.setdefault("notes", []).append(
+            "no browsing profile -- run `kerb setup` first for a stable session")
+    elif not prof.signed_in:
+        # Their predecessor scraper called this the "limited view". Saying it
+        # once, up front, beats a user wondering why review data is missing.
+        q.report.setdefault("notes", []).append(
+            "signed out of Google: listings are complete, review data is not. "
+            "`kerb setup --import-cookies` lifts this.")
+
     pages = max(1, int(q.options.get("max_pages", 5)))
     pause = float(q.options.get("pause", 2.0))
     zoom_km = float(q.options.get("zoom_km", 10))
