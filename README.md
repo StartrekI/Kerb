@@ -69,6 +69,7 @@ about a business.
 | Understand what it measures | [What it measures](#what-it-measures) |
 | Write a brief by hand and schedule it | [The brief](#the-brief) |
 | Know why reviews are missing | [Signed out vs signed in](#signed-out-vs-signed-in--read-this-bit) |
+| Scrape review text | [Reviews — opt-in](#reviews--opt-in-and-the-one-place-a-browser-is-needed) |
 | Not get blocked | [Staying unblocked](#staying-unblocked) |
 | Know what it *can't* do | [What Kerb does not do](#what-kerb-does-not-do) |
 
@@ -338,6 +339,110 @@ says so, too.
 
 ---
 
+## Reviews — opt-in, and the one place a browser is needed
+
+Everything above runs over plain HTTP with no browser at all. Reviews are the
+exception, and they are a **separate, deliberate step**:
+
+```bash
+kerb run brief.yaml          # no browser, no reviews
+kerb reviews <run-id>        # only if you actually want them
+```
+
+Running it over a finished run has a useful consequence: reviews are harvested
+for the businesses that **qualified**, not for everything discovery happened to
+find. On a 2,000-business run that is usually a few dozen, not two thousand.
+
+### Why a browser is unavoidable here
+
+Kerb collects listings without one because the Maps search endpoint answers
+plain HTTP. Reviews do not. They arrive through an internal RPC whose
+`x-maps-bgbind` and `x-maps-bgkey` headers are **session-scoped and cannot be
+synthesised** — replaying without them gets a valid-looking request rejected.
+
+So the browser is used to *take a copy of one real request*, and then closed out
+of the loop. Everything after the capture is a plain fetch chain.
+
+**The browser is a key-cutter, not a scraper.** That distinction is what keeps
+it fast: scrolling the review pane makes Maps render every review as a DOM node,
+so pages that arrive every ~0.9s early take ~6s by page 100. Chaining the cursor
+by hand renders nothing and pages arrive at a flat **~220ms** — roughly **80
+seconds against 35–45 minutes** on a 3,650-review business.
+
+### Setting it up — two things, once each
+
+**1. Install the browser extra**
+
+```bash
+pip install "kerb[browser]"
+```
+
+The core stays at two dependencies. This is only pulled in if you ask for it,
+and it is imported only at the moment a browser is actually opened — a
+pure-HTTP run never loads it.
+
+**2. Sign the profile in**
+
+This is the part that catches everyone. **Google serves signed-out clients a
+Maps page with no Reviews tab at all** — the rating is there, the reviews are
+not. A browser does not fix that; being signed in does.
+
+```bash
+kerb setup --import-cookies ~/Downloads/cookies.txt
+kerb setup --check
+```
+
+```
+profile: ~/.kerb/session.json
+         6 cookie(s), locale en/uk, created 2d ago
+         signed in to Google: yes
+
+working, signed in. `kerb serve` and pick Google Maps.
+```
+
+See [Signed out vs signed in](#signed-out-vs-signed-in--read-this-bit) for the
+two ways to export cookies. Kerb never asks for a password and never opens a
+sign-in form.
+
+If you skip this step, Kerb tells you exactly what happened rather than
+returning an empty list:
+
+```
+Google served the signed-out view of this place: rating shown,
+no Reviews tab, no count. Sign the profile in once with
+`kerb setup --import-cookies FILE`.
+```
+
+### Harvesting
+
+```bash
+kerb reviews 88c16e73a314                      # qualified businesses
+kerb reviews 88c16e73a314 --max-reviews 200    # cap per business
+kerb reviews 88c16e73a314 --limit 20           # only the first 20 businesses
+kerb reviews 88c16e73a314 --all                # every business, not just qualified
+```
+
+Output is JSONL, one review per line:
+
+```json
+{"id": "Ch…", "reviewer": "…", "rating": 5, "text": "…",
+ "relative_date": "a week ago", "timestamp_us": 1723…, "owner_reply": null,
+ "photos": 2, "cid": "0x487…:0x3ce…", "business": "Edgbaston Dental Centre"}
+```
+
+One browser is opened for the whole command and closed when it finishes —
+`kerb stop` closes it too. Nothing is left behind.
+
+### Review counts without the reviews
+
+If you only want the **number**, there is a lighter path: `reviews_live` is an
+EXPENSIVE-tier signal, so it runs only on businesses that already passed every
+cheaper condition. Enable it in a brief and it opens one page per surviving
+business rather than per discovered one — on a 2,000-business run that is about
+a minute instead of an hour.
+
+---
+
 ## The brief
 
 The UI is a builder for a YAML file, and nothing more. Everything the UI can express,
@@ -414,6 +519,7 @@ kerb setup --check     # is the profile working? am I cooling down?
 | `kerb setup` | Builds the browsing profile. `--check` verifies it, `--import-cookies` signs it in |
 | `kerb run brief.yaml` | Runs headless, writes CSV / JSON / JSONL |
 | `kerb estimate brief.yaml` | What it *would* do, without doing it |
+| `kerb reviews <run>` | Harvests review text for a finished run — opt-in, needs `kerb[browser]` and a signed-in profile |
 | `kerb requalify <run>` | Re-judge a stored run with today's packs and rules — no re-collection |
 | `kerb jobs` | Durable runs: what finished, what's left |
 | `kerb doctor` | Checks the install, the profile, and stray processes |
@@ -428,11 +534,12 @@ disk filled. Kerb launches none — but it still checks.
 
 Every project has these. Most hide them.
 
-- **Review counts, signed out.** Google serves signed-out clients a reduced view
-  of Maps. Kerb does **not** invent a count — a guessed one silently changes every
-  score — so it reports those businesses as *never found out* and the UI offers
-  `rating_band` instead. [Sign in once](#signed-out-vs-signed-in--read-this-bit)
-  and the limit lifts.
+- **Reviews without a browser.** The review RPC's headers are session-scoped and
+  cannot be synthesised, so review counts and review text need
+  [`kerb[browser]` and a signed-in profile](#reviews--opt-in-and-the-one-place-a-browser-is-needed).
+  Signed out, Kerb reports those businesses as *never found out* rather than
+  inventing a count — a guessed one silently changes every score — and the UI
+  offers `rating_band` instead, which **is** collected over plain HTTP.
 - **Synonyms.** A typed trade matches by substring, so `cafes` will not find
   "Coffee shop" until you add `coffee` to the keywords. Google knows they're
   synonyms; a string matcher doesn't.
