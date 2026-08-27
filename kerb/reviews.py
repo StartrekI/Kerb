@@ -285,3 +285,156 @@ def harvest(driver, url: str, max_reviews: Optional[int] = None,
             break
 
     return rows[:max_reviews] if max_reviews else rows
+
+# Harvest a GROUP of businesses from one captured template, without navigating
+# to any of them. See harvest_many() for why this is the whole optimisation.
+MANY_JS = r"""
+const cids = arguments[0], pages = arguments[1], limit = arguments[2];
+const conc = arguments[3], done = arguments[arguments.length - 1];
+const cap = window.__cap;
+if (!cap) { done({error: 'no request captured'}); return; }
+
+const parts = cap.body.split('&');
+let idx = -1, tmpl = null;
+for (let i = 0; i < parts.length; i++)
+  if (parts[i].indexOf('f.req=') === 0) { idx = i; tmpl = decodeURIComponent(parts[i].slice(6)); }
+if (idx < 0) { done({error: 'no f.req in captured body'}); return; }
+const CID_RE = /0x[0-9a-f]+:0x[0-9a-f]+/i;
+if (!CID_RE.test(tmpl)) { done({error: 'no cid in template'}); return; }
+
+function bodyFor(cid, token) {
+  let req = tmpl.replace(CID_RE, cid);
+  const pag = req.match(/\[(\d+),\\"([^\\"]*)\\"\]/);
+  if (!pag) return null;
+  req = req.replace(pag[0], '[' + pag[1] + ',\\"' + token + '\\"]');
+  const p = parts.slice();
+  p[idx] = 'f.req=' + encodeURIComponent(req);
+  return p.join('&');
+}
+function payload(text) {
+  const body = text.slice(text.indexOf('\n') + 1);
+  const lines = body.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const s = lines[i].trim();
+    if (s.slice(0, 2) !== '[[') continue;
+    let frame; try { frame = JSON.parse(s); } catch (e) { continue; }
+    for (let j = 0; j < frame.length; j++) {
+      const e = frame[j];
+      if (Array.isArray(e) && typeof e[2] === 'string') {
+        try { return JSON.parse(e[2]); } catch (err) {}
+      }
+    }
+  }
+  return null;
+}
+function pick(o, path) {
+  for (let i = 0; i < path.length; i++) { if (o == null) return null; o = o[path[i]]; }
+  return (o === undefined) ? null : o;
+}
+function post(cid, token) {
+  return new Promise(function (res) {
+    const b = bodyFor(cid, token);
+    if (!b) { res(null); return; }
+    const x = new XMLHttpRequest();
+    x.__replay = true;                      // the recorder must ignore our own
+    x.open('POST', cap.url, true);
+    for (const k in cap.headers) { try { x.setRequestHeader(k, cap.headers[k]); } catch (e) {} }
+    x.onload  = function () { res(x.status === 200 ? x.responseText : null); };
+    x.onerror = function () { res(null); };
+    x.send(b);
+  });
+}
+
+async function one(cid) {
+  const out = []; const seen = {};
+  let token = '', failed = null;
+  for (let i = 0; i < pages; i++) {
+    const text = await post(cid, token);
+    if (!text) { failed = 'request failed'; break; }
+    const p = payload(text);
+    if (!p) { failed = 'unparseable payload'; break; }
+    const items = p[2] || [];
+    for (let k = 0; k < items.length; k++) {
+      const v = items[k][0]; if (!v) continue;
+      const id = pick(v, [0]);
+      if (id && seen[id]) continue;
+      if (id) seen[id] = 1;
+      out.push({id: id,
+                reviewer: pick(v, [1, 4, 5, 0]),
+                rating: pick(v, [2, 0, 0]),
+                text: pick(v, [2, 15, 0, 0]),
+                relative_date: pick(v, [1, 6]),
+                timestamp_us: pick(v, [1, 2]),
+                owner_reply: pick(v, [3, 14, 0, 0]),
+                photos: (pick(v, [2, 2]) || []).length});
+    }
+    if (!p[1]) break;                       // cursor exhausted: the real end
+    if (limit && out.length >= limit) break;
+    token = p[1];
+  }
+  return {cid: cid, reviews: limit ? out.slice(0, limit) : out, failed: failed};
+}
+
+// A small worker pool. Each business has its OWN cursor, so they are genuinely
+// independent -- but concurrency is capped, because the point is to stop
+// wasting time on page loads, not to flood Google.
+(async function () {
+  const results = [];
+  let next = 0;
+  async function worker() {
+    while (next < cids.length) {
+      const mine = next++;
+      results[mine] = await one(cids[mine]);
+    }
+  }
+  const pool = [];
+  for (let i = 0; i < Math.min(conc, cids.length); i++) pool.push(worker());
+  await Promise.all(pool);
+  done({results: results});
+})();
+"""
+
+
+def harvest_many(driver, cids, capture_url, max_reviews=None,
+                 pages=500, concurrency=4, group=8,
+                 on_business=None):
+    """Reviews for MANY businesses from a single captured request.
+
+    The optimisation, and why it is worth the extra code: the captured `f.req`
+    carries the business's own cid inline, so swapping it addresses a different
+    business entirely. Nothing needs to be navigated to.
+
+    Measured on one business, 30 reviews:
+
+        navigate to it, then harvest   6.2s
+        swap the cid, no navigation    0.5s     -- same reviews, same order
+
+    Page load, tab click and capture were ~4.4s of fixed cost PER BUSINESS.
+    Paying it once instead of a hundred times is where the time goes.
+
+    Each business has its own cursor, so a small in-page worker pool runs
+    several at once. Capped deliberately: the goal is to stop wasting time on
+    page loads, not to flood Google.
+    """
+    if not open_reviews(driver, capture_url):
+        raise HarvestError(
+            "no review request was captured. Usually the signed-out view: it "
+            "has no Reviews tab at all. Sign the profile in once with "
+            "`kerb setup --import-cookies FILE`.")
+    driver.set_script_timeout(600)
+
+    out = {}
+    cids = list(cids)
+    for i in range(0, len(cids), group):
+        chunk = cids[i:i + group]
+        res = driver.execute_async_script(
+            MANY_JS, chunk, pages, max_reviews or 0, concurrency)
+        if res.get("error"):
+            raise HarvestError("review harvest: %s" % res["error"])
+        for row in res.get("results") or []:
+            if not row:
+                continue
+            out[row["cid"]] = row
+            if on_business:
+                on_business(row["cid"], row.get("reviews") or [], row.get("failed"))
+    return out

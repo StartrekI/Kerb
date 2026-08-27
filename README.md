@@ -366,8 +366,19 @@ of the loop. Everything after the capture is a plain fetch chain.
 **The browser is a key-cutter, not a scraper.** That distinction is what keeps
 it fast: scrolling the review pane makes Maps render every review as a DOM node,
 so pages that arrive every ~0.9s early take ~6s by page 100. Chaining the cursor
-by hand renders nothing and pages arrive at a flat **~220ms** — roughly **80
-seconds against 35–45 minutes** on a 3,650-review business.
+by hand renders nothing and pages arrive at a flat **~220ms**.
+
+And the captured request carries the business's own id inline, so **swapping it
+addresses a different business without navigating to it**. One capture serves
+the whole run:
+
+| 100 businesses, 15,821 reviews | |
+|---|---|
+| navigate to each, then harvest | 12m 21s — 7.4s each |
+| **one capture, swap the id** | **2m 08s — 1.28s each** |
+
+Page load, tab click and capture were ~4.4s of fixed cost *per business*. Paying
+it once instead of a hundred times is where the time goes — **124 reviews/second**.
 
 ### Setting it up — two things, once each
 

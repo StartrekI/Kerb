@@ -951,26 +951,34 @@ def cmd_reviews(args) -> int:
     say(C.dim("  one browser, reused; the request is captured once per place"))
 
     total, failed = 0, 0
+    from .reviews import harvest_many
     from .session import Profile
+    by_cid = {str(r.get("cid")): r for r in rows}
+    first_url = ((rows[0].get("extras") or {}).get("maps_url")
+                 or _maps_url(str(rows[0].get("cid") or "")))
     drv = detail._driver(Profile.load())
     try:
         with out_path.open("w") as fh:
-            for i, r in enumerate(rows, 1):
-                url = ((r.get("extras") or {}).get("maps_url")
-                       or _maps_url(str(r.get("cid") or "")))
-                name = (r.get("name") or r.get("cid") or "?")[:38]
-                try:
-                    got = harvest(drv, url, max_reviews=args.max_reviews)
-                except HarvestError as exc:
+            def wrote(cid, revs, fail):
+                nonlocal total, failed
+                r = by_cid.get(cid) or {}
+                name = (r.get("name") or cid or "?")[:38]
+                if fail and not revs:
                     failed += 1
-                    say(" ", C.bad("%-40s" % name), C.dim(str(exc)[:60]))
-                    continue
-                for rev in got:
-                    rev["cid"] = r.get("cid")
+                    say(" ", C.bad("%-40s" % name), C.dim(str(fail)[:52]))
+                    return
+                for rev in revs:
+                    rev["cid"] = cid
                     rev["business"] = r.get("name")
                     fh.write(_json.dumps(rev) + "\n")
-                total += len(got)
-                say(" ", C.good("%-40s" % name), C.dim("%d reviews" % len(got)))
+                total += len(revs)
+                say(" ", C.good("%-40s" % name), C.dim("%d reviews" % len(revs)))
+
+            harvest_many(drv, list(by_cid), first_url,
+                         max_reviews=args.max_reviews, on_business=wrote)
+    except HarvestError as exc:
+        say(C.bad("harvest failed:"), str(exc))
+        return 1
     finally:
         # The predecessor's worst failure was a driver outliving its run.
         detail.close()
