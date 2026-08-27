@@ -1,0 +1,41 @@
+id: trades/_shared-vetoes
+version: 1
+label: Universal non-trade categories
+description: |
+  Categories that are never a service business regardless of what the search
+  term was. Every entry is a real production false positive -- a result that
+  passed a keyword match and would have shipped as a qualified lead.
+
+  Trade packs inherit these; they only need to list vetoes specific to them.
+veto_categories:
+  - warehouse
+  - apartment
+  - condominium
+  - housing society
+  - gated community          # "Hills View - Dubai Hills Estate" matched roofing
+  - community center         # "JBR - Jumeirah Beach Residence" matched roofing
+  - real estate
+  - property investment
+  - property management
+  - car repair
+  - auto                     # "Roof Auto" = car sunroofs
+  - surveyor                 # "Why cafe roof top" was categorised Surveyor
+  - water skiing             # "ALMAROOF PERFORMANCE jetski"
+  - restaurant               # "ZouZou Turkish & Lebanese" matched roofing
+  - cafe
+  - bar
+  - tattoo shop              # "InkPaint Tattoo Studio" matched painting
+  - art gallery              # Tanjore painting is art, not decorating
+  - art class
+  - art school
+  - art studio
+  - painting class
+  - college
+  - exhibit
+  - artist
+  - wholesaler
+  - distributor
+  - trading company
+  - supplier
+  - hardware store
+  - home goods store

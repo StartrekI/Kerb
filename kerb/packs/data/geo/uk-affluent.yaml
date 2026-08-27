@@ -1,0 +1,29 @@
+id: geo/uk-affluent
+version: 1
+label: UK — affluent towns
+description: >
+  Towns where a local business can plausibly afford a website rebuild. Ordered
+  most-promising first, which matters because a run that stops early should
+  have spent its time at the top of this list, not the middle.
+  Replace wholesale with your own at ~/.kerb/packs/geo/uk-affluent.yaml.
+places:
+  - Kensington, London
+  - Chelsea, London
+  - Richmond, London
+  - Islington, London
+  - Hampstead, London
+  - Wimbledon, London
+  - St Albans
+  - Guildford
+  - Winchester
+  - Harrogate
+  - Cheltenham
+  - Bath
+  - Oxford
+  - Cambridge
+  - Tunbridge Wells
+  - Solihull
+  - Altrincham
+  - Esher
+  - Beaconsfield
+  - Marlow

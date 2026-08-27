@@ -1,0 +1,16 @@
+id: trades/painting
+version: 1
+label: Painting contractor
+categories: [Painter, Painting, Painting contractor, House painter]
+keywords: [painting, painter, "wall painting", "texture painting"]
+veto_categories:
+  - paint store                  # sells paint, does not apply it
+  - paintings store              # "SUSIL TOOLS & PAINTS"
+  - gypsum product supplier
+  - building materials
+  - house cleaning service
+  - plumber                      # "Plumbing Work, Painting Work, Borewell"
+notes: |
+  A big brand's own painting-SERVICE arm (e.g. Asian Paints Beautiful Homes)
+  IS in scope. The test is "performs painting work", not "is independent" --
+  an earlier run wrongly excluded these and had to be reversed.

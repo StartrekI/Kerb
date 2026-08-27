@@ -1,0 +1,15 @@
+id: trades/dentist
+version: 1
+label: Dentist
+categories:
+  [Dentist, Dental clinic, Dental implants periodontist, Cosmetic dentist,
+   Orthodontist, Pediatric dentist, Emergency dental service, Dental hygienist]
+keywords: [dentist, dental, orthodont, endodont, periodont]
+locale_terms:
+  de: [zahnarzt]
+  fr: [dentiste]
+  es: [dentista]
+veto_categories:
+  - dental laboratory            # makes appliances, treats nobody
+  - dental supply store
+  - medical supply store

@@ -1,0 +1,14 @@
+id: trades/hvac
+version: 1
+label: HVAC contractor
+categories:
+  [HVAC contractor, Air conditioning contractor, Heating contractor,
+   Furnace repair service, Air conditioning repair service]
+keywords: [hvac, "air conditioning", "heating and cooling", furnace, "climate control"]
+locale_terms:
+  de: [klimaanlage]
+  fr: [climatisation]
+veto_categories:
+  - auto air conditioning service   # "Ralph's Re-gas Mobile Car Air Conditioning"
+  - car repair
+  - appliance store

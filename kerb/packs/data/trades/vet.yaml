@@ -1,0 +1,11 @@
+id: trades/vet
+version: 1
+label: Veterinary clinic
+categories: [Veterinarian, Veterinary care, Animal hospital, Emergency veterinarian]
+keywords: [veterinary, "vet clinic", "animal hospital"]
+veto_categories:
+  - pet groomer
+  - pet store
+  - pet supply store
+  - dog day care
+  - restaurant                   # "Pawdy Neighbors" matched a vet search

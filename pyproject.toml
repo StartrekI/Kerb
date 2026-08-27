@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kerb"
+version = "0.1.0"
+description = "Find and qualify local businesses. Anywhere, any trade."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["leads", "local-business", "openstreetmap", "prospecting", "qualification"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Office/Business",
+]
+
+# The floor is deliberately low and the ceiling deliberately absent. This is a
+# tool people install next to whatever they already have; pinning tightly would
+# make it fight their environment for no benefit it can actually demonstrate.
+dependencies = [
+  "PyYAML>=5.4",
+  "httpx>=0.23",
+]
+
+[project.optional-dependencies]
+# The engine and the CLI run without these. Only the server needs them, so
+# `pip install kerb` stays small for anyone who only wants `kerb run`.
+server = [
+  "fastapi>=0.100",
+  "uvicorn>=0.20",
+  "pydantic>=2.0",
+]
+dev = [
+  "pytest>=7.0",
+]
+
+[project.scripts]
+kerb = "kerb.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kerb-tool/kerb"
+Issues = "https://github.com/kerb-tool/kerb/issues"
+
+[tool.setuptools.packages.find]
+include = ["kerb*"]
+
+[tool.setuptools.package-data]
+# Packs and the UI are data, not code, and both must survive a wheel build --
+# a pack that ships broken silently disables a filter the user wrote.
+#
+# index.html is listed by name rather than as static/*.html on purpose: the
+# directory also holds _smoke.html, the dev harness that drives the real UI in
+# a headless browser. It has to live here to be served same-origin, and it must
+# never reach a user's install.
+kerb = ["packs/data/**/*.yaml", "static/index.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

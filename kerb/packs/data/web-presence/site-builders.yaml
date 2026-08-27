@@ -1,0 +1,29 @@
+id: web-presence/site-builders
+version: 1
+label: Free site builders
+description: |
+  A real page the owner controls, built on a free platform. The judgement call
+  in this taxonomy, documented because it is the one debatable line: a business
+  on one of these HAS a site, but a weak one -- which arguably makes them the
+  best prospect of all, since they have already demonstrated they want a web
+  presence and have outgrown the tool.
+
+  Treat as prospect or not via campaign config, not by editing this file.
+
+  square.site is here and NOT in booking-hosts: it is Square's free WEBSITE
+  builder, not a booking widget. Getting that wrong disqualified a real
+  business whose Maps profile plainly showed hannah-heller.square.site.
+hosts:
+  - square.site
+  - business.site
+  - sites.google.com
+  - business.google.com
+  - wixsite.com
+  - weebly.com
+  - godaddysites.com
+  - myshopify.com
+  - webnode.com
+  - webnode.at
+  - jimdosite.com
+  - blogspot.com
+  - wordpress.com

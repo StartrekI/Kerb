@@ -1,0 +1,32 @@
+id: web-presence/social-hosts
+version: 1
+label: Social and directory profiles
+description: |
+  A social profile is a presence, not a website. Still a prospect -- often a
+  better one, since the owner has already shown they will maintain something
+  online.
+hosts:
+  - facebook.com
+  - fb.com
+  - fb.me
+  - instagram.com
+  - instagr.am
+  - tiktok.com
+  - twitter.com
+  - x.com
+  - yelp.com
+  - yelp.ca
+  - linkedin.com
+  - linktr.ee
+  - youtube.com
+  - youtu.be
+  - pinterest.com
+  - wa.me
+  - whatsapp.com
+  - api.whatsapp.com
+  - t.me
+  - snapchat.com
+  - nextdoor.com
+  - bit.ly
+  - beacons.ai
+  - carrd.co

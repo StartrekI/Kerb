@@ -1,0 +1,26 @@
+id: geo/us-metro
+version: 1
+label: US — large metros
+description: >
+  High-density metros, most-promising first. Deliberately a starting point
+  rather than a complete list -- a hundred cities in a pack nobody curated is
+  worse than twenty someone did.
+places:
+  - Manhattan, New York
+  - Brooklyn, New York
+  - San Francisco, California
+  - Los Angeles, California
+  - Chicago, Illinois
+  - Boston, Massachusetts
+  - Seattle, Washington
+  - Austin, Texas
+  - Denver, Colorado
+  - Miami, Florida
+  - Atlanta, Georgia
+  - Dallas, Texas
+  - Houston, Texas
+  - Philadelphia, Pennsylvania
+  - Phoenix, Arizona
+  - San Diego, California
+  - Portland, Oregon
+  - Nashville, Tennessee

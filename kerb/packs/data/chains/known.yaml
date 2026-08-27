@@ -1,0 +1,42 @@
+id: chains/known
+version: 1
+label: Known multi-location brands
+description: >
+  Brands recognisable from a single row, so a chain is caught even when only
+  one of its branches falls inside the search area. The dataset tally cannot
+  see that case: one branch in the area looks exactly like an independent.
+
+  Deliberately short and conservative. A false positive here deletes a real
+  lead, so entries are limited to brands that are unambiguously multi-site.
+  Add your own in ~/.kerb/packs/chains/known.yaml -- a user pack of the same
+  id replaces this one wholesale.
+
+brands:
+  # Optical / dental / medical -- the verticals this is most often run against
+  - { name: Specsavers, locations: 900 }
+  - { name: Vision Express, locations: 550 }
+  - { name: Boots Opticians, locations: 550 }
+  - { name: Bupa Dental Care, locations: 400 }
+  - { name: mydentist, locations: 550 }
+  - { name: Portman Dental Care, locations: 200 }
+  - { name: Rodericks Dental, locations: 150 }
+  - { name: Aspen Dental, locations: 1000 }
+  - { name: Western Dental, locations: 350 }
+  - { name: Banfield Pet Hospital, locations: 1000 }
+  - { name: VCA Animal Hospitals, locations: 1000 }
+  - { name: Vets4Pets, locations: 450 }
+  - { name: Medivet, locations: 300 }
+  # Trades and home services
+  - { name: Dyno-Rod, locations: 200 }
+  - { name: Pimlico Plumbers, locations: 20 }
+  - { name: Roto-Rooter, locations: 600 }
+  - { name: Mr. Rooter, locations: 200 }
+  - { name: ServiceMaster, locations: 700 }
+  - { name: CertaPro Painters, locations: 350 }
+  # Fitness and salons
+  - { name: PureGym, locations: 400 }
+  - { name: Anytime Fitness, locations: 5000 }
+  - { name: The Gym Group, locations: 240 }
+  - { name: Toni & Guy, locations: 250 }
+  - { name: Supercuts, locations: 2000 }
+  - { name: Great Clips, locations: 4000 }

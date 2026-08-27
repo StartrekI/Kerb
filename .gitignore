@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# THE BROWSING PROFILE. session.json holds the cookies `kerb setup` collected.
+# A cookie jar is a credential even though no password is in it, so it must
+# never reach a public repo.
+.kerb/
+session.json
+*.session.json
+
+# The run ledger. SQLite plus its write-ahead log: machine-local state, often
+# large, and it carries every business a run collected.
+*.db
+*.db-wal
+*.db-shm
+
+# Local campaign output and anything a run writes
+/out/
+*.ATTRIBUTION.txt
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

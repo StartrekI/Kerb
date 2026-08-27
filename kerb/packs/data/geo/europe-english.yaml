@@ -1,0 +1,26 @@
+id: geo/europe-english
+version: 1
+label: Europe — English-speaking business culture
+description: >
+  Cities where English-language outreach lands without translation. Pair with
+  a `name_script` filter: this narrows WHERE, that narrows WHO.
+places:
+  - Dublin
+  - Cork
+  - Galway
+  - Amsterdam
+  - Rotterdam
+  - The Hague
+  - Eindhoven
+  - Copenhagen
+  - Aarhus
+  - Stockholm
+  - Gothenburg
+  - Oslo
+  - Bergen
+  - Helsinki
+  - Zurich
+  - Geneva
+  - Luxembourg
+  - Brussels
+  - Malta

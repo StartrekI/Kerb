@@ -1,0 +1,51 @@
+id: web-presence/booking-hosts
+version: 1
+label: Booking platforms
+description: |
+  A link here means the business rents a page on someone else's product. It is
+  NOT a website, and the business is still a prospect. Filtering a scraper's
+  export on "website IS NULL" silently discards every one of these -- which in
+  the salon and barber trades is a large share of the market.
+
+  Regional by nature: no single team can maintain this globally, which is
+  precisely why it is community data. Entries marked (found) were discovered
+  automatically by the collision rule -- a domain shared by unrelated
+  businesses cannot be any one business's own domain.
+hosts:
+  - vagaro.com
+  - fresha.com
+  - styleseat.com
+  - booksy.com
+  - booksy.net
+  - squareup.com          # NOT square.site -- see site-builders
+  - glossgenius.com
+  - boulevard.io
+  - getboulevard.com
+  - schedulicity.com
+  - setmore.com
+  - mindbodyonline.com
+  - phorest.com
+  - salonrunner.com
+  - treatwell.co.uk
+  - treatwell.com
+  - acuityscheduling.com
+  - calendly.com
+  - simplybook.me
+  - bookwhen.com
+  - timely.com
+  - gettimely.com
+  - shedul.com
+  - salonized.com
+  - booker.com
+  - go.booker.com
+  - zenoti.com
+  - meevo.com
+  - rosy.com
+  - daysmart.com
+  - mynewbooking.com      # (found) was scored as an owned domain
+  - bychronos.com         # (found) same
+  - blismo.com            # (found) blismo.com/s/<business>/a/<id>
+  - getsquire.com         # (found) barber trade
+  - thecut.co             # (found) barber trade
+  - prcny.co              # (found) per-business subdomains
+  - barberly.app          # (found) per-business subdomains

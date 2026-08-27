@@ -1,0 +1,11 @@
+title,category,address,phone,website,review_rating,review_count,latitude,longitude,cid
+Bright Smile Dental,Dentist,"12 High St, London",+442071234567,,4.8,64,51.51,-0.13,0x1a:0x001
+The Chelsea Practice,Dental clinic,"88 Kings Rd, London",+442079876543,https://vagaro.com/thechelsea,4.6,88,51.48,-0.17,0x1a:0x002
+Mayfair Orthodontics,Orthodontist,"3 Mount St, London",+442075551234,https://mayfairortho.co.uk,4.9,210,51.51,-0.15,0x1a:0x003
+Kensington Dental Lab,Dental laboratory,"5 Lab Way, London",+442075550000,,4.2,41,51.50,-0.19,0x1a:0x004
+Smile Studio Notting Hill,Dentist,"7 Portobello Rd, London",+442075559999,https://facebook.com/smilestudio,4.7,55,51.51,-0.20,0x1a:0x005
+Old Town Dental,Dentist,"9 Old St, London",+442075558888,,4.1,12,51.52,-0.09,0x1a:0x006
+Camden Dental Care,Dentist,"14 Camden High St",+442075557777,https://camden-dental.square.site,4.5,73,51.54,-0.14,0x1a:0x007
+Shuttered Dental Rooms,Dentist,"1 Empty St, London",,,3.9,31,51.50,-0.10,0x1a:0x008
+Hackney Dental Supply,Dental supply store,"22 Supply Rd",+442075556666,https://hackneysupply.co.uk,4.0,38,51.55,-0.06,0x1a:0x009
+Islington Family Dentist,Dentist,"40 Upper St, London",+442075555555,,4.9,142,51.54,-0.10,0x1a:0x00a

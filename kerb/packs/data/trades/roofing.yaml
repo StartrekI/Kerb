@@ -1,0 +1,24 @@
+id: trades/roofing
+version: 1
+label: Roofing contractor
+categories: [Roofing contractor, Roofer, Roofing service, Waterproofing service]
+keywords: [roof, roofing, roofer, shingle, gutter]
+locale_terms:
+  nl: [dakwerken, dakdekker]
+  de: [dachdecker]
+  fr: [couvreur, toiture, toiturier]
+  sv: [takläggare]
+  no: [taktekker]
+veto_categories:
+  - water damage restoration     # remediation, not construction
+  - insulation contractor
+  - air conditioning contractor
+  - paving contractor
+  - garage door supplier
+  - plumber
+  - interior designer
+  - pest control
+  - road contractor
+notes: |
+  "roof" as a bare substring is dangerous: it matches Almaroof (a surname),
+  sunroof, and rooftop bars. Category is checked before name for that reason.

@@ -1,0 +1,12 @@
+id: trades/medical
+version: 1
+label: Medical clinic
+categories:
+  [Medical clinic, Urgent care center, Family practice physician,
+   General practitioner, Walk-in clinic, Medical Center]
+keywords: [medical clinic, urgent care, family medicine, walk-in clinic]
+veto_categories:
+  - medical supply store
+  - pharmacy
+  - medical laboratory
+  - health insurance agency

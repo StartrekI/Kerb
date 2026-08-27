@@ -1,0 +1,38 @@
+name: dentists-no-website
+description: |
+  Qualify an existing gosom export. No scraping — this reads data you already
+  hold and shows what your own filter missed.
+
+sources:
+  - id: csv
+    options:
+      path: tests/fixtures/gosom_export.csv
+
+what:
+  packs: [trades/dentist]
+
+filters:
+  - signal: trade_match
+    op: "!="
+    value: false
+  - signal: web_presence
+    op: in
+    value: [none, booking_only, social_only]
+  - signal: reviews
+    op: ">="
+    value: 30
+  - signal: liveness
+    op: "=="
+    value: open
+
+scoring:
+  weights:
+    web_presence:
+      none: 40
+      booking_only: 32
+      social_only: 28
+      builder: 15
+      owned_domain: 0
+    reviews: { weight: 35, scale: log, cap: 300 }
+    trade_match: 25
+  normalise: true
