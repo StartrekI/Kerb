@@ -106,16 +106,51 @@ def _driver(profile):
             return _DRIVER
         webdriver, Options = _selenium()
         opts = Options()
+        # An existing Chrome profile directory, if one is offered. Cookies in
+        # kerb's own jar cover most of it, but a real profile carries the whole
+        # signed-in session -- which is what the review RPC needs and what the
+        # predecessor's `signin.py` produced.
+        import os as _os
+        udd = _os.environ.get("KERB_CHROME_PROFILE")
+        if udd:
+            opts.add_argument("--user-data-dir=" + _os.path.abspath(_os.path.expanduser(udd)))
         opts.add_argument("--headless=new")
-        opts.add_argument("--window-size=1400,1000")
+        # A tall viewport loads more per screen; carried over from the
+        # predecessor, which measured it as meaningfully fewer rounds.
+        opts.add_argument("--window-size=1500,2400")
         opts.add_argument("--disable-gpu")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--lang=%s" % profile.locale.get("hl", "en"))
+        opts.add_argument("--lang=en-US")
+        opts.add_argument("--disable-notifications")
+        opts.add_argument("--mute-audio")
+        # An explicit desktop UA. Without one Chrome sends a HeadlessChrome
+        # token and Google serves the reduced view -- rating, no Reviews tab.
+        opts.add_argument("--user-agent=" + profile.user_agent)
         opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        opts.add_experimental_option("prefs", {"intl.accept_languages": "en,en_US"})
         drv = webdriver.Chrome(options=opts)
-        drv.set_page_load_timeout(45)
+        drv.set_page_load_timeout(60)
+        try:
+            drv.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator,'webdriver',"
+                           "{get:()=>undefined});"})
+        except Exception:                       # noqa: BLE001
+            pass                                # cosmetic only
+        try:
+            # Install the review recorder BEFORE the document exists. Patching
+            # the live page after load is a race we lose: Maps takes its own
+            # references to XMLHttpRequest during startup, so a late patch
+            # observes zero fetches and strands the harvest.
+            from ..reviews import RECORDER_JS
+            drv.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "(function(){%s})();" % RECORDER_JS})
+        except Exception:                       # noqa: BLE001
+            pass
 
         # Carry the profile's session in. Cookies must be added on the domain
         # they belong to, so a cheap page is opened first.

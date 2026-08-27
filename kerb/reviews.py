@@ -69,10 +69,19 @@ if (!window.__kerbRec) {
       // the request, and first-write-wins would replay the pre-sort template
       // and silently harvest the wrong order. Our own replays tag themselves
       // so the chain cannot clobber the template it is chaining from.
-      if (!this.__replay &&
-          String(this.__u).indexOf('batchexecute') !== -1 &&
-          body.indexOf('ListUgcPosts') !== -1) {
-        window.__cap = {url: String(this.__u), body: body, headers: this.__h};
+      // Match the TRANSPORT, not the rpc name. The original keyed on the
+      // literal 'ListUgcPosts'; Google has since obfuscated the rpcid to
+      // things like `qv9Egd`, at which point a name match captures nothing
+      // and the harvest silently reports zero reviews. Any batchexecute the
+      // page issues is a candidate; a named one is preferred if it appears,
+      // and the caller decides by whether the payload actually chains.
+      if (!this.__replay && String(this.__u).indexOf('batchexecute') !== -1) {
+        const named = body.indexOf('ListUgcPosts') !== -1;
+        if (named || !window.__capNamed) {
+          window.__cap = {url: String(this.__u), body: body, headers: this.__h,
+                          named: named, at: Date.now()};
+          if (named) window.__capNamed = true;
+        }
       }
     } catch (e) {}
     return os.call(this, b);
@@ -199,6 +208,10 @@ def open_reviews(driver, url: str, settle: float = 2.0, timeout: float = 20.0) -
     driver.get(url)
     time.sleep(settle)
     driver.execute_script(RECORDER_JS)
+    # Forget anything captured during page load: Maps issues an unrelated
+    # batchexecute before the reviews pane is ever opened, and chaining that
+    # one returns a payload with no review items in it.
+    driver.execute_script("window.__cap = null; window.__capNamed = false;")
 
     # Click whatever the Reviews tab is called in this locale. Matching on the
     # aria-label rather than the visible text keeps it working when the label is
