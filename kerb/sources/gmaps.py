@@ -29,16 +29,37 @@ moves, one number changes.
 from __future__ import annotations
 
 import json
+import queue
 import random
+import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional
 
 import httpx
 
 from ..models import Business, SourceQuery
+from ..collect import RateLimiter
 from ..session import Profile
 from . import source
-from .overpass import geocode
+from .overpass import geocode as _geocode_uncached
+
+# Nominatim is a volunteer service asking for at most one request a second, and
+# a campaign that searches fifty trades across a hundred towns would otherwise
+# geocode the same hundred towns fifty times over. The box for a place does not
+# change during a run, so it is looked up once.
+_GEO: Dict[str, Any] = {}
+_GEO_LOCK = threading.Lock()
+
+
+def geocode(place: str, client, **kw):
+    key = " ".join(str(place or "").lower().split())
+    with _GEO_LOCK:
+        if key in _GEO:
+            return _GEO[key]
+    box = _geocode_uncached(place, client, **kw)
+    with _GEO_LOCK:
+        _GEO[key] = box
+    return box
 
 ENDPOINT = "https://www.google.com/search"
 
@@ -63,6 +84,11 @@ RATING_AT = 7              # index inside FIELDS["rating"]
 PB_TEMPLATE = ("!4m12!1m3!1d{span}!2d{lng}!3d{lat}!2m3!1f0!2f0!3f0"
                "!3m2!1i1024!2i768!4f13.1!7i{take}!8i{skip}!10b1"
                "!12m3!1e3!2b1!3e2!2b1!4b1!9b0")
+
+# A neutral point. Only the text query decides which businesses come back, so
+# this is a placeholder the pb requires rather than a location that means
+# anything. See the note in one_place().
+CENTRE = (51.5, -0.12)
 
 PAGE = 20                  # the endpoint's page size
 RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -315,62 +341,145 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
     hl = str(q.options.get("hl") or prof.locale.get("hl", "en"))
     gl = str(q.options.get("gl") or prof.locale.get("gl", "us"))
 
-    yielded = 0
-    with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0, connect=10.0),
-                      headers=prof.headers(), cookies=prof.cookies) as client:
-        for place in q.places:
-            try:
+    # Cap raised from 8 to 32 to allow measuring where the ceiling actually is.
+    # The SHARED limiter, not the worker count, is what paces the pool -- so
+    # raising this alone changes nothing unless `pause` is lowered with it.
+    want_geocode = bool(q.options.get("geocode", False))
+    workers = max(1, min(int(q.options.get("workers", 1) or 1), 32))
+    # One SHARED limiter. Six workers each pausing a second still make six
+    # requests a second, so the pacing has to be aggregate or it is not pacing.
+    limiter = RateLimiter(per_second=(1.0 / pause) if pause > 0 else 0.0)
+
+    def one_place(client, place, out, stop, lock, counter):
+        """Collect a single place. Returns nothing; pushes onto `out`."""
+        try:
+            # MEASURED: the viewport coordinates do not affect the results.
+            # "dentist Manchester" returns 20/20 Manchester businesses whether
+            # the pb carries Manchester's coordinates, London's, or a neutral
+            # UK point -- the text query is what Google resolves.
+            #
+            # Geocoding was therefore doing no work while being the single
+            # point of failure for the whole collector: Nominatim is a
+            # volunteer service that rate-limits, and one 429 from it turned an
+            # 80-place run into zero results with Google answering perfectly.
+            # It is now opt-in, for anyone who genuinely wants a viewport
+            # tighter than the place name implies.
+            lat, lng = CENTRE
+            if want_geocode:
                 box = geocode(place, client, retries=retries, backoff=backoff)
                 if not box:
-                    q.report.setdefault("skipped_places", {})[
-                        "gmaps/%s" % place] = "could not be geocoded"
-                    continue
+                    with lock:
+                        q.report.setdefault("skipped_places", {})[
+                            "gmaps/%s" % place] = "could not be geocoded"
+                    return
                 lat = (box["north"] + box["south"]) / 2.0
                 lng = (box["east"] + box["west"]) / 2.0
 
-                seen_here = 0
-                for page in range(pages):
-                    pb = template.format(span=_span(zoom_km), lat=lat, lng=lng,
-                                         take=PAGE, skip=page * PAGE)
-                    raw = _request(client, {"tbm": "map", "authuser": "0",
-                                            "hl": hl, "gl": gl,
-                                            "q": "%s %s" % (q.what, place),
-                                            "pb": pb},
-                                   retries, backoff, tally=q.report)
-                    found = parse(raw, place)
-                    for biz in found:
-                        yield biz
-                        yielded += 1
-                        seen_here += 1
-                        if q.limit and yielded >= q.limit:
+            seen_here = 0
+            for page in range(pages):
+                if stop.is_set():
+                    return
+                limiter.acquire()
+                pb = template.format(span=_span(zoom_km), lat=lat, lng=lng,
+                                     take=PAGE, skip=page * PAGE)
+                with lock:
+                    tally = q.report
+                raw = _request(client, {"tbm": "map", "authuser": "0",
+                                        "hl": hl, "gl": gl,
+                                        "q": "%s %s" % (q.what, place),
+                                        "pb": pb},
+                               retries, backoff, tally=tally)
+                found = parse(raw, place)
+                for biz in found:
+                    if stop.is_set():
+                        return
+                    with lock:
+                        if q.limit and counter[0] >= q.limit:
+                            stop.set()
                             return
-                    if len(found) < PAGE:
-                        break                       # last page for this place
-                    _sleep(pause)
-
-                if seen_here == 0:
-                    # Reported, not swallowed. "Nothing here" and "we could not
-                    # read here" look identical in a result count.
+                        counter[0] += 1
+                    out.put(biz)
+                    seen_here += 1
+                if len(found) < PAGE:
+                    break
+            if seen_here == 0:
+                with lock:
                     q.report.setdefault("skipped_places", {})[
                         "gmaps/%s" % place] = "no listings returned for this trade"
-            except Blocked as exc:
-                # A block applies to the address, not the place, so every
-                # remaining place would hit it too. Stopping is the honest move
-                # -- and the penalty is recorded so the NEXT run waits too.
-                wait = prof.record_block()
-                q.report["fatal"] = ("%s Kerb will stay off this endpoint for %s."
-                                     % (exc, _ago(wait)))
-                q.report["cooldown_seconds"] = wait
-                return
-            except ShapeChanged as exc:
+        except Blocked as exc:
+            # A block is on the ADDRESS, so every other worker is about to hit
+            # it too. Stop them all rather than let five more prove the point --
+            # and record it ONCE. Four workers each calling record_block() made
+            # one block look like four and compounded a 15-minute cooldown into
+            # two hours.
+            with lock:
+                first = not stop.is_set()
+                stop.set()
+                if first:
+                    wait = prof.record_block()
+                    q.report["fatal"] = ("%s Kerb will stay off this endpoint "
+                                         "for %s." % (exc, _ago(wait)))
+                    q.report["cooldown_seconds"] = wait
+        except ShapeChanged as exc:
+            with lock:
                 q.report["fatal"] = (
                     "%s Kerb stopped rather than report an empty result." % exc)
-                return
-            except Exception as exc:                # noqa: BLE001
+            stop.set()
+        except Exception as exc:                # noqa: BLE001
+            with lock:
                 q.report.setdefault("skipped_places", {})[
                     "gmaps/%s" % place] = "%s: %s" % (type(exc).__name__, exc)
-                continue
-            _sleep(pause)
 
-        # Every place completed without a block: nothing is owed.
+    out: "queue.Queue" = queue.Queue()
+    stop = threading.Event()
+    lock = threading.Lock()
+    counter = [0]
+    places = list(q.places)
+
+    if workers == 1:
+        # The simple path stays simple: no threads, no queue, easiest to debug.
+        with httpx.Client(follow_redirects=True,
+                          timeout=httpx.Timeout(30.0, connect=10.0),
+                          headers=prof.headers(), cookies=prof.cookies) as client:
+            for place in places:
+                one_place(client, place, out, stop, lock, counter)
+                while not out.empty():
+                    yield out.get()
+                if stop.is_set():
+                    return
+                _sleep(pause)
+        prof.record_success()
+        return
+
+    # Each worker gets its OWN client -- httpx.Client is not designed to be
+    # shared for concurrent use, and one connection pool per worker is also
+    # what keeps a slow place from stalling the others.
+    def worker(names):
+        with httpx.Client(follow_redirects=True,
+                          timeout=httpx.Timeout(30.0, connect=10.0),
+                          headers=prof.headers(), cookies=prof.cookies) as client:
+            for place in names:
+                if stop.is_set():
+                    return
+                one_place(client, place, out, stop, lock, counter)
+
+    # Round-robin rather than contiguous blocks: neighbouring places have
+    # similar yields, so slicing by block gives one worker all the slow ones.
+    shards = [places[i::workers] for i in range(workers)]
+    threads = [threading.Thread(target=worker, args=(sh,), daemon=True,
+                                name="gmaps-%d" % i)
+               for i, sh in enumerate(shards) if sh]
+    for t in threads:
+        t.start()
+
+    # Drain as results arrive, so the pipeline can start judging immediately
+    # instead of waiting for every place to finish.
+    while any(t.is_alive() for t in threads) or not out.empty():
+        try:
+            yield out.get(timeout=0.2)
+        except queue.Empty:
+            continue
+    for t in threads:
+        t.join(timeout=5)
+    if not stop.is_set():
         prof.record_success()

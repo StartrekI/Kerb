@@ -171,6 +171,10 @@ class Pipeline:
             if isinstance(spec, dict) and spec.get("enabled") is False:
                 continue
             opts = (spec.get("options") if isinstance(spec, dict) else {}) or {}
+            # A source that can parallelise should be told how much it may.
+            # Without this, limits.workers was a setting the collector never saw.
+            opts = dict(opts)
+            opts.setdefault("workers", self.c.limits.workers.get("discover", 1))
             query = SourceQuery(what=self.c.trade, places=places,
                                 path=opts.get("path"), limit=self.c.limits.max_results,
                                 options=opts)

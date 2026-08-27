@@ -1112,6 +1112,14 @@ def find_managed() -> List[Dict[str, Any]]:
 def cmd_stop(args) -> int:
     """Terminate, wait, kill, then VERIFY. Reporting success without checking
     is how orphans survive a cleanup that claimed to work."""
+
+    # A driver that outlives its run is the predecessor's worst failure. The
+    # detail signal shares one browser; closing it is part of stopping.
+    try:
+        from .signals.detail import close as _close_browser
+        _close_browser()
+    except Exception:                            # noqa: BLE001
+        pass
     try:
         procs = find_managed()
     except CannotEnumerate as exc:

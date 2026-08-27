@@ -129,7 +129,7 @@ def compute(name: str, business: Business, ctx: Context) -> Signal:
 
 
 # Importing the built-ins registers them.
-from . import web_presence, trade_match, liveness, reviews, establishment_age  # noqa: E402,F401
+from . import detail, web_presence, trade_match, liveness, reviews, establishment_age  # noqa: E402,F401
 from . import shape  # noqa: E402,F401  -- free, derived
 from . import site   # noqa: E402,F401  -- the CHEAP tier
 

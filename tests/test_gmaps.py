@@ -165,10 +165,14 @@ def test_an_unreadable_place_is_reported_not_swallowed():
 
 
 def test_a_place_that_will_not_geocode_is_reported():
+    """Only when geocoding is asked for. It is off by default now: the viewport
+    was measured to have no effect on results, so Nominatim was a single point
+    of failure doing no work -- one 429 from it zeroed an 80-place run while
+    Google was answering perfectly."""
     _fresh_profile()
     handler = lambda r: httpx.Response(200, text=FIXTURE)        # noqa: E731
     q = SourceQuery(what="dentist", places=["Nowhere", "Islington"],
-                    options={"pause": 0})
+                    options={"pause": 0, "geocode": True})
     rows = drive(q, handler)
     assert len(rows) == 4, "the good place must still be collected"
     assert "gmaps/Nowhere" in (q.report.get("skipped_places") or {})
@@ -334,6 +338,142 @@ def test_signed_out_is_detected_and_said_out_loud():
     print("  signed-out state reported    ok")
 
 
+def test_parallel_places_collect_everything_exactly_once():
+    """Sharding must not drop a place or double-count one. Round-robin over
+    workers is easy to get subtly wrong in a way only volume exposes."""
+    _fresh_profile()
+    places = ["P%02d" % i for i in range(13)]      # prime-ish, uneven shards
+    seen_places = []
+    lock = __import__("threading").Lock()
+
+    def handler(request):
+        with lock:
+            seen_places.append(request.url.params.get("q", ""))
+        return httpx.Response(200, text=FIXTURE)
+
+    q = SourceQuery(what="dentist", places=places,
+                    options={"pause": 0, "workers": 4, "max_pages": 1})
+    rows = drive(q, handler)
+    assert len(rows) == 13 * 4, len(rows)          # 4 records per place
+    got = {r.place_label for r in rows}
+    assert got == set(places), sorted(set(places) - got)
+    print("  parallel: every place once   ok")
+
+
+def test_parallel_respects_the_limit_exactly():
+    """Four workers racing on one counter is where an off-by-N appears."""
+    _fresh_profile()
+    q = SourceQuery(what="dentist", places=["A", "B", "C", "D", "E", "F"],
+                    limit=9, options={"pause": 0, "workers": 4, "max_pages": 1})
+    rows = drive(q, lambda r: httpx.Response(200, text=FIXTURE))
+    assert len(rows) == 9, len(rows)
+    print("  parallel: limit is exact     ok")
+
+
+def test_a_block_in_one_worker_stops_them_all():
+    """A block is on the address. Five more workers proving it costs five more
+    strikes against the same IP."""
+    _fresh_profile()
+    calls = {"n": 0}
+    lock = __import__("threading").Lock()
+
+    def handler(request):
+        with lock:
+            calls["n"] += 1
+        return httpx.Response(429, text="<html>sorry</html>")
+
+    q = SourceQuery(what="dentist", places=["A", "B", "C", "D", "E", "F", "G", "H"],
+                    options={"pause": 0, "workers": 4, "retries": 1})
+    rows = drive(q, handler)
+    assert rows == []
+    assert calls["n"] <= 4, "one strike per live worker, not per place: %s" % calls
+    assert "fatal" in q.report
+    assert session.Profile.load(TEST_PROFILE).cooling() > 0
+    _fresh_profile()
+    print("  parallel: block stops all    ok")
+
+
+def test_one_block_is_recorded_once_not_once_per_worker():
+    """Four workers hitting the same 429 recorded four blocks, compounding a
+    15-minute cooldown into two hours for a single event.
+
+    A BARRIER is the whole test. Without it every worker checks `stop` before
+    its request, so the first one to fail short-circuits the rest and the bug
+    never appears -- measured at 0 catches in 10 runs. The real failure had all
+    four already IN FLIGHT when the 429s came back, which is what this forces.
+    """
+    import threading as _t
+    _fresh_profile()
+    N = 4
+    gate = _t.Barrier(N, timeout=10)
+
+    def handler(request):
+        try:
+            gate.wait()          # nobody gets a 429 until all four are waiting
+        except _t.BrokenBarrierError:
+            pass
+        return httpx.Response(429, text="<html>sorry</html>")
+
+    q = SourceQuery(what="d", places=list("ABCD"),
+                    options={"pause": 0, "workers": N, "retries": 1})
+    drive(q, handler)
+    prof = session.Profile.load(TEST_PROFILE)
+    assert prof.blocks == 1, (
+        "one block event recorded %d times -- the cooldown compounds to %ds "
+        "instead of 900s" % (prof.blocks, prof.cooling()))
+    assert prof.cooling() <= 900 + 5, prof.cooling()
+    _fresh_profile()
+    print("  one block counted once       ok")
+
+
+def test_concurrent_profile_saves_do_not_race():
+    """Every thread wrote to the same `.tmp` and renamed it, so the first
+    rename moved the file out from under the second -- and it died at exactly
+    the moment the profile most needs writing, recording a block."""
+    import threading as _t
+    _fresh_profile()
+    p0 = session.Profile({}, TEST_PROFILE); p0.created = 1.0; p0.save()
+    errs = []
+
+    def hammer():
+        try:
+            for _ in range(30):
+                session.Profile.load(TEST_PROFILE).save()
+        except Exception as exc:            # noqa: BLE001
+            errs.append(exc)
+
+    ts = [_t.Thread(target=hammer) for _ in range(8)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    assert not errs, errs[:2]
+    assert not list(TEST_PROFILE.parent.glob(TEST_PROFILE.name + ".tmp*")), "temp files left"
+    _fresh_profile()
+    print("  concurrent saves are safe    ok")
+
+
+def test_geocoding_is_off_by_default():
+    """The collector must not call Nominatim unless asked. It is a volunteer
+    service, and depending on it for something measured to be irrelevant is how
+    an 80-place run returned zero with Google working fine."""
+    _fresh_profile()
+    called = []
+    real = gmaps.geocode
+    gmaps.geocode = lambda p, c, **k: (called.append(p) or
+                                       {"north": 1, "south": 0, "east": 1, "west": 0})
+    try:
+        httpx.Client = lambda **kw: _REAL_CLIENT(
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, text=FIXTURE)))
+        rows = list(gmaps.gmaps_source(
+            SourceQuery(what="d", places=["A", "B"], options={"pause": 0})))
+    finally:
+        httpx.Client = _REAL_CLIENT
+        gmaps.geocode = real
+    assert called == [], "geocoded without being asked: %s" % called
+    assert len(rows) == 8, len(rows)
+    _fresh_profile()
+    print("  no geocoding by default      ok")
+
+
 if __name__ == "__main__":
     print("gmaps -- the collector Kerb runs itself\n")
     for fn in (test_parses_a_real_response,
@@ -353,6 +493,12 @@ if __name__ == "__main__":
                test_no_trade_and_no_places_are_refused,
                test_a_live_cooldown_refuses_to_start,
                test_a_clean_run_clears_the_penalty,
+               test_parallel_places_collect_everything_exactly_once,
+               test_parallel_respects_the_limit_exactly,
+               test_a_block_in_one_worker_stops_them_all,
+               test_one_block_is_recorded_once_not_once_per_worker,
+               test_concurrent_profile_saves_do_not_race,
+               test_geocoding_is_off_by_default,
                test_profile_round_trips_and_is_private):
         fn()
     print("\nall gmaps checks passed")

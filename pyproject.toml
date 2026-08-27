@@ -30,6 +30,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Only the reviews_live signal needs this, and only on businesses that already
+# passed every cheaper condition. `pip install kerb` stays at two dependencies.
+browser = [
+  "selenium>=4.20",
+]
+
 # The engine and the CLI run without these. Only the server needs them, so
 # `pip install kerb` stays small for anyone who only wants `kerb run`.
 server = [

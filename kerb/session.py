@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -96,9 +97,20 @@ class Profile:
                 "checked": self.checked, "blocked_at": self.blocked_at,
                 "cooldown_until": self.cooldown_until, "blocks": self.blocks,
                 "signed_in": self.signed_in}
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(body, indent=2))
-        os.replace(tmp, self.path)              # atomic: never a half-written jar
+        # A temp name UNIQUE to this writer. Every thread previously wrote to
+        # the same `.tmp` and then renamed it, so with parallel workers the
+        # first rename moved the file out from under the second and it died
+        # with FileNotFoundError while recording a block -- the one moment the
+        # profile most needs to be written.
+        tmp = self.path.with_suffix(".tmp.%d.%d" % (os.getpid(), threading.get_ident()))
+        try:
+            tmp.write_text(json.dumps(body, indent=2))
+            os.replace(tmp, self.path)          # atomic: never a half-written jar
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
         try:
             os.chmod(self.path, 0o600)          # a cookie jar is a credential
         except OSError:
