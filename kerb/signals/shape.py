@@ -249,7 +249,12 @@ RATING_MAX = 5.0
 @signal(name="rating_band", cost=Cost.FREE, version=1,
         label="Rating band",
         description="excellent / good / mixed / poor -- with volume taken into account",
-        kind="categorical", values=["excellent", "good", "mixed", "poor", "unrated", "unknown"])
+        kind="categorical", values=["excellent", "good", "mixed", "poor", "unrated", "unknown"],
+        # Not on by default -- which end of the market to target depends on the
+        # pitch. But it is what the UI offers in place of a review count the
+        # source cannot supply, and switching to it with nothing ticked left a
+        # brief that "would reject everything".
+        suggest={"op": "in", "value": ["excellent", "good"]})
 def rating_band(biz: Business, ctx: Context) -> Signal:
     """Which end of the market this is, as a category rather than a number.
 

@@ -304,7 +304,10 @@ def _span(zoom_km: float) -> int:
 
 @source(id="gmaps", label="Google Maps",
         description="Collected by Kerb itself -- no key, no browser, no scraper",
-        takes="places", cannot_measure=("reviews",),
+        # Everything built on the review count: the collector never has one
+        # (see gmaps_source), signed in or not.
+        takes="places",
+        cannot_measure=("reviews", "review_velocity", "establishment_age"),
         instead={"reviews": "rating_band"},
         legal_note="Reads public business listings the way the Maps site does. "
                    "This is against Google's Terms of Service, and the endpoint "
@@ -343,7 +346,8 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
         # Their predecessor scraper called this the "limited view". Saying it
         # once, up front, beats a user wondering why review data is missing.
         q.report.setdefault("notes", []).append(
-            "signed out of Google: listings are complete, review data is not. "
+            "signed out of Google: listings are complete, but review data "
+            "(`reviews_live`, `kerb reviews`) needs a signed-in profile -- "
             "`kerb setup --import-cookies` lifts this.")
 
     pages = max(1, int(q.options.get("max_pages", 5)))

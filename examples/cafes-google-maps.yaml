@@ -1,0 +1,37 @@
+name: cafes-north-london
+description: |
+  Independent cafes in two London boroughs, straight from Google Maps. Needs
+  `kerb setup` once. Reading Maps this way is against Google's Terms of
+  Service -- see Legal in the README before running it.
+
+sources:
+  - id: gmaps
+    options: {pause: 2, workers: 1}
+
+where:
+  places: [Islington London, Camden London]
+
+what:
+  trade: cafes
+  # Google knows these are synonyms; a string matcher does not.
+  keywords: [cafe, coffee, espresso, roastery]
+  categories: [cafe, coffee, espresso, roastery]
+
+filters:
+  - {signal: trade_match, op: "!=", value: false}
+  - {signal: web_presence, op: in, value: [none, social_only, booking_only]}
+  # Google Maps listings carry a rating but no review count, so filter on the
+  # rating band rather than `reviews`.
+  - {signal: rating_band, op: in, value: [excellent, good]}
+  - {signal: chain_size, op: "<=", value: 3}
+
+scoring:
+  weights:
+    web_presence: {none: 40, social_only: 35, booking_only: 30}
+    rating_band: {excellent: 30, good: 20}
+    chain_size: {weight: 20, scale: log, cap: 10, invert: true}
+
+limits:
+  max_results: 200
+  max_requests: 60
+  max_runtime_seconds: 900

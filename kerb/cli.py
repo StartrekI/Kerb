@@ -145,6 +145,21 @@ def attributions(verdicts: List[Dict[str, Any]]) -> List[str]:
     return seen
 
 
+def best_first(rows: List[Dict[str, Any]],
+               include_rejected: bool = False) -> List[Dict[str, Any]]:
+    """What a results file holds: qualified businesses best first, then -- when
+    asked for -- everything else, in the order it was found.
+
+    Rejected rows used to be written in discovery order with the qualified ones
+    mixed in, so the same run read as a different list the moment
+    --include-rejected was added.
+    """
+    if not include_rejected:
+        rows = [r for r in rows if r.get("qualified")]
+    return sorted(rows, key=lambda r: (not r.get("qualified"),
+                                       -(r.get("score") or 0)))
+
+
 def shape_output(rows: List[Dict[str, Any]],
                  cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Apply the campaign's `output:` block.
@@ -491,12 +506,7 @@ def cmd_run(args) -> int:
     merged = {str(r["cid"]).lower(): r for r in done}
     for v in verdicts:
         merged[v.business.cid] = v.to_dict()
-    rows_all = list(merged.values())
-    if args.include_rejected:
-        rows = rows_all
-    else:
-        rows = sorted([r for r in rows_all if r.get("qualified")],
-                      key=lambda r: -(r.get("score") or 0))
+    rows = best_first(list(merged.values()), args.include_rejected)
 
     st = pipe.stats
     say("")
@@ -578,11 +588,15 @@ def cmd_run(args) -> int:
         say(C.dim("  " + note))
 
     # Distinct exit codes, because a script needs to tell "nothing matched"
-    # from "we were cut off and the dataset is incomplete".
-    if pipe.breaker.tripped:
-        return 4
+    # from "we were cut off and the dataset is incomplete". Incomplete means
+    # what the API calls `partial` -- a budget, the breaker, a place that could
+    # not be read or a source that failed. Only the breaker used to count, so a
+    # run capped by max_requests exited 0 and a cron job took it as complete.
+    from .pipeline import terminal_status
     if interrupted:
         return 130
+    if pipe.breaker.tripped or terminal_status(st.to_dict()) == "partial":
+        return 4
     return 0 if st.qualified else 3
 
 
@@ -745,10 +759,7 @@ def _run_durable(args, campaign, progress, suppression=None) -> int:
         # the ledger lost the qualified/rejected counts it had just saved.
         run_stats = {**res.to_dict(), **counts, "total": len(verdicts)}
 
-        rows = [v.to_dict() for v in verdicts]
-        if not args.include_rejected:
-            rows = sorted([r for r in rows if r.get("qualified")],
-                          key=lambda r: -(r.get("score") or 0))
+        rows = best_first([v.to_dict() for v in verdicts], args.include_rejected)
 
         st = pipe.stats
         say("")
@@ -771,7 +782,11 @@ def _run_durable(args, campaign, progress, suppression=None) -> int:
         else:
             json.dump(rows, sys.stdout, indent=2, default=str)
             print()
-        return 4 if res.stopped else (0 if st.qualified else 3)
+        # 4 as in a plain run: stopped early, or places given up on or still
+        # queued -- the run is resumable, and not complete.
+        if res.stopped or res.failures or left:
+            return 4
+        return 0 if st.qualified else 3
     finally:
         store.close()
 
@@ -853,10 +868,7 @@ def cmd_requalify(args) -> int:
             say(C.good("  %d verdicts updated in the ledger" % len(verdicts)))
 
         if args.out:
-            rows = [v.to_dict() for v in verdicts]
-            if not args.include_rejected:
-                rows = sorted([r for r in rows if r.get("qualified")],
-                              key=lambda r: -(r.get("score") or 0))
+            rows = best_first([v.to_dict() for v in verdicts], args.include_rejected)
             rows = shape_output(rows, campaign.output)
             target = Path(args.out).expanduser()
             fmt = args.format or (target.suffix.lstrip(".") if

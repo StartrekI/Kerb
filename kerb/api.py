@@ -981,8 +981,8 @@ def create_app() -> FastAPI:
         summary = summary_for(run_id)
         if summary is None:
             raise HTTPException(404, "no run %s" % run_id)
-        from .cli import (_flatten, attributions, csv_safe, render_template,
-                          shape_output, template_fields)
+        from .cli import (_flatten, attributions, best_first, csv_safe,
+                          render_template, shape_output, template_fields)
 
         row_data = run_data(run_id) if include_rejected else qualified_data(run_id)
         campaign = _campaign_for(run_id)
@@ -990,7 +990,7 @@ def create_app() -> FastAPI:
         # Best first, as the CLI writes it. The ledger returns rows by cid, and
         # shape_output only sorts when an output block exists -- so a campaign
         # without one exported its leads in id order, not score order.
-        row_data = sorted(row_data, key=lambda r: -(r.get("score") or 0))
+        row_data = best_first(row_data, include_rejected)
         row_data = shape_output(row_data, cfg)
 
         name = "kerb-%s-%s.%s" % (

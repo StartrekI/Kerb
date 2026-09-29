@@ -167,7 +167,12 @@ def _category(tags: Dict[str, str]) -> Optional[str]:
 
 @source(id="overpass", label="OpenStreetMap",
         description="Free, licensed, no key required — the default source",
-        legal_note="ODbL. Commercial use permitted with attribution: %s" % ATTRIBUTION)
+        legal_note="ODbL. Commercial use permitted with attribution: %s" % ATTRIBUTION,
+        # OSM carries no reviews, and no Google identity for reviews_live to
+        # look one up by. Declared so the UI says so before a run, instead of
+        # a `reviews` condition sending every business to "never found out".
+        cannot_measure=("reviews", "review_velocity", "establishment_age",
+                        "reviews_live"))
 def overpass_source(q: SourceQuery) -> Iterator[Business]:
     tags = (q.options.get("tags")
             or TRADE_TAGS.get((q.what or "").lower())

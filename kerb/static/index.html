@@ -1419,7 +1419,9 @@ async function validate(){
     const src = currentSource();
     const cannot = (src.cannot_measure || [])
       .filter(n => c.filters.some(f => f.signal === n));
-    if (cannot.length){
+    /* Shown only once the campaign is otherwise valid: "no places" is the
+       thing to fix first, and one notice at a time is the house rule. */
+    const showCannot = () => {
       const names = cannot.map(n =>
         S.caps.signals.find(x => x.name === n)?.label || n);
       $("#problems").innerHTML = `<div class="notice warn"><i></i><div>
@@ -1440,13 +1442,13 @@ async function validate(){
       $("#validTxt").textContent = "Cannot measure";
       $("#validTxt").style.color = "var(--k-warn)";
       $("#readyNote").textContent = "";
-      return;
-    }
+    };
     const empty = c.filters.filter(f => f.op === "in" && (f.value || []).length === 0)
       .concat([])
       .map(f => S.caps.signals.find(x => x.name === f.signal)?.label || f.signal);
     try{
       const r = await api.post("/api/campaigns/validate", {campaign:c});
+      if (cannot.length && r.valid){ showCannot(); return; }
       if (empty.length){
         $("#problems").innerHTML = `<div class="notice warn"><i></i><div>
           <b>${esc(empty.join(", "))} would reject everything</b>
@@ -1471,7 +1473,11 @@ async function validate(){
       $("#readyNote").textContent = r.valid
         ? `${c.filters.length} ${c.filters.length===1?"condition":"conditions"} · free tests
            only unless you turned on a paid signal.` : "";
-    }catch(e){ /* server down; the run button will surface it */ }
+    }catch(e){
+      /* Server down; the run button will surface that. What this source
+         cannot measure is known without it, so still say so. */
+      if (cannot.length) showCannot();
+    }
   }, 220);
 }
 
@@ -1645,8 +1651,11 @@ async function startRun(){
   $("#stopBtn").hidden = false; $("#stopBtn").disabled = false;
   $("#toFindingsBtn").disabled = true;
   S.rows = []; S.sel = null; S.logN = 0; S.t0 = Date.now();
-  S.tiersUsed = new Set(campaign.filters
-    .map(f => (S.caps.signals.find(x => x.name === f.signal) || {}).cost)
+  /* Filters and weights both: a paid signal named only in the ranking is
+     measured too, and calling its tier "skipped" would be untrue. */
+  S.tiersUsed = new Set([...campaign.filters.map(f => f.signal),
+                         ...Object.keys(campaign.scoring.weights || {})]
+    .map(n => (S.caps.signals.find(x => x.name === String(n).split(".")[0]) || {}).cost)
     .filter(c => c && c !== "free"));
   /* What the record shows as evidence: whatever this brief filtered or ranked
      on. Those are the measurements that justify the verdict. */
@@ -1706,7 +1715,10 @@ function logLine(t, kind, msg, col){
   $("#logCount").textContent = ++S.logN;
 }
 
-const STAGE_AT = {discover:0, dedupe:1, free:2, qualified:4, done:4};
+/* Positions come from stages(), which grows with the registry's tiers. Fixed
+   numbers here marked "Expensive signals" as running on every verdict and left
+   Score "running" after the run had finished. */
+const stageAt = key => stages().findIndex(s => s[2] === key);
 
 function onEvent(e){
   if (e.i !== undefined) {           // replayed events must not render twice
@@ -1717,7 +1729,7 @@ function onEvent(e){
   if (e.stage === "qualified"){
     logLine(t, "qualified", `${e.name}  ${e.score}`, "var(--k-good)");
     $("#cQual").textContent = e.total ?? $("#cQual").textContent;
-    renderStages(4);
+    renderStages(stageAt("score"));
   } else if (e.stage === "discover"){
     logLine(t, "discover", `${e.source||""} ${e.found ?? e.status ?? ""}`);
     if (e.found != null) $("#cResolved").textContent = e.found;
@@ -1744,7 +1756,7 @@ function onEvent(e){
     if (e.discovered != null) $("#cResolved").textContent = e.discovered;
     $("#cMeasured").textContent = e.deduped ?? 0;
     $("#cUn").textContent = e.unevaluated ?? 0;
-    S.stats = e; renderStages(5);
+    S.stats = e; renderStages(stages().length);     // every stage behind it
   } else if (e.stage === "error"){
     logLine(t, "error", e.error, "var(--k-crit)");
   } else {
