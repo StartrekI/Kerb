@@ -240,7 +240,7 @@ behind the registry, so the UI could not express things the config file could.
 | `liveness` | Liveness | categorical | free | open, temp_closed, perm_closed, stale, unknown | `== open` **on** |
 | `chain_size` | Chain size | number | free | — | `<= 3` |
 | `contactable` | Contactable | boolean | free | — | `== true` |
-| `rating_band` | Rating band | categorical | free | excellent, good, mixed, poor, unrated, unknown | — |
+| `rating_band` | Rating band | categorical | free | excellent, good, mixed, poor, unrated, unknown | `in [excellent, good]` |
 | `review_integrity` | Review integrity | categorical | free | complete, truncated, unavailable | — |
 | `review_velocity` | Review velocity | number | free | — | — |
 | `establishment_age` | First review year | number | free | — | — (a year: `rank: false`) |
@@ -577,8 +577,8 @@ trouble renders. Keep these callable with no side effects beyond re-rendering.
 
 ```bash
 python3 -m kerb serve --port 8811          # then, headless:
-#   /assets/_smoke.html?w=1500&h=1250&theme=dark   → 65 checks, errors=[], DONE=1
-python3 -m pytest tests/ -q                # → 235 passed
+#   /assets/_smoke.html?w=1500&h=1250&theme=dark   → 67 checks, errors=[], DONE=1
+python3 -m pytest tests/ -q                # → 244 passed
 python3 -m kerb stop                       # → clean, nothing left
 ```
 

@@ -1,0 +1,29 @@
+name: roofers-leeds
+description: |
+  Roofers in and around Leeds from OpenStreetMap -- free, licensed data, no key.
+  Keeps the ones with no website of their own, or only a social or booking page.
+
+sources:
+  - id: overpass            # the default source; tags come from the roofing pack
+
+where:
+  places: [Leeds, Wakefield, Harrogate]
+
+what:
+  packs: [trades/roofing]
+
+filters:
+  - {signal: trade_match, op: "!=", value: false}
+  - {signal: web_presence, op: in, value: [none, social_only, booking_only]}
+  - {signal: contactable, op: "==", value: true}
+  # No `reviews` condition: OpenStreetMap carries no reviews, so every business
+  # would be reported as "never found out".
+
+scoring:
+  weights:
+    web_presence: {none: 40, social_only: 30, booking_only: 25}
+    chain_size: {weight: 20, scale: log, cap: 10, invert: true}   # independents first
+
+limits:
+  max_results: 300
+  max_requests: 200
