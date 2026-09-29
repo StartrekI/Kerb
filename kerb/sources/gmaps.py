@@ -38,7 +38,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import httpx
 
 from ..models import Business, SourceQuery
-from ..collect import RateLimiter
+from ..collect import Halt, RateLimiter
 from ..session import Profile
 from . import source
 from .overpass import geocode as _geocode_uncached
@@ -104,11 +104,14 @@ class ShapeChanged(RuntimeError):
     """
 
 
-class Blocked(RuntimeError):
+class Blocked(Halt):
     """Google served a consent wall, a CAPTCHA, or a rate-limit page.
 
     Kerb does not attempt to solve or bypass any of these. It stops and says so,
     because a collector that fights a block is one that gets an address banned.
+
+    A Halt, so the durable collector stops the whole run and hands the place
+    back to the queue instead of recording it as done with nothing in it.
     """
 
 
@@ -116,7 +119,11 @@ def _clean(raw: str) -> Any:
     """Strip the XSSI prefix and parse. Anything else is a block page."""
     text = raw.lstrip()
     if text.startswith(")]}'"):
-        text = text[text.index("\n") + 1:]
+        # find, not index: a prefix with no newline after it is a mangled
+        # response, and index() raised ValueError -- reported as a generic
+        # error on one place rather than the shape change it is.
+        cut = text.find("\n")
+        text = text[cut + 1:] if cut >= 0 else ""
     elif text[:15].lower().startswith("<!doctype") or text[:6].lower() == "<html>":
         raise Blocked("Google returned a web page instead of data -- usually a "
                       "consent wall or a rate-limit block. Run `kerb setup`, or "
@@ -234,15 +241,22 @@ def _num(v) -> Optional[float]:
 
 def _request(client: httpx.Client, params: Dict[str, str],
              retries: int, backoff: float,
-             tally: Optional[Dict[str, Any]] = None) -> str:
+             tally: Optional[Dict[str, Any]] = None,
+             lock: Optional[threading.Lock] = None) -> str:
     """One page, retried on the failures that are expected of a busy endpoint."""
     last: Optional[Exception] = None
     for attempt in range(max(1, retries)):
         try:
             # Counted before the response, so retries count too: a retry is
-            # spend, and a budget that ignores them is not a budget.
+            # spend, and a budget that ignores them is not a budget. Under the
+            # workers' shared lock, because a read-add-write from four threads
+            # at once loses increments and the budget undercounts.
             if tally is not None:
-                tally["requests"] = tally.get("requests", 0) + 1
+                if lock is not None:
+                    with lock:
+                        tally["requests"] = tally.get("requests", 0) + 1
+                else:
+                    tally["requests"] = tally.get("requests", 0) + 1
             r = client.get(ENDPOINT, params=params)
             if r.status_code == 429 or "/sorry/" in str(r.url):
                 raise Blocked(
@@ -348,7 +362,17 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
     workers = max(1, min(int(q.options.get("workers", 1) or 1), 32))
     # One SHARED limiter. Six workers each pausing a second still make six
     # requests a second, so the pacing has to be aggregate or it is not pacing.
-    limiter = RateLimiter(per_second=(1.0 / pause) if pause > 0 else 0.0)
+    #
+    # The durable collector hands over ITS limiter, because it sets `pause` to
+    # 0 so the two do not multiply. Building one from that 0 left every page
+    # after the first in a place unpaced -- five requests back to back.
+    limiter = q.options.get("_limiter") or RateLimiter(
+        per_second=(1.0 / pause) if pause > 0 else 0.0)
+
+    def failed(place: str, why: str) -> None:
+        """A place that could not be read. The run is incomplete without it."""
+        with lock:
+            q.report.setdefault("failed_places", {})[place] = why
 
     def one_place(client, place, out, stop, lock, counter):
         """Collect a single place. Returns nothing; pushes onto `out`."""
@@ -368,9 +392,7 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
             if want_geocode:
                 box = geocode(place, client, retries=retries, backoff=backoff)
                 if not box:
-                    with lock:
-                        q.report.setdefault("skipped_places", {})[
-                            "gmaps/%s" % place] = "could not be geocoded"
+                    failed(place, "could not be geocoded")
                     return
                 lat = (box["north"] + box["south"]) / 2.0
                 lng = (box["east"] + box["west"]) / 2.0
@@ -382,13 +404,11 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
                 limiter.acquire()
                 pb = template.format(span=_span(zoom_km), lat=lat, lng=lng,
                                      take=PAGE, skip=page * PAGE)
-                with lock:
-                    tally = q.report
                 raw = _request(client, {"tbm": "map", "authuser": "0",
                                         "hl": hl, "gl": gl,
                                         "q": "%s %s" % (q.what, place),
                                         "pb": pb},
-                               retries, backoff, tally=tally)
+                               retries, backoff, tally=q.report, lock=lock)
                 found = parse(raw, place)
                 for biz in found:
                     if stop.is_set():
@@ -402,10 +422,13 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
                     seen_here += 1
                 if len(found) < PAGE:
                     break
-            if seen_here == 0:
+            if seen_here == 0 and not stop.is_set():
+                # Read fine and nothing was there -- which is not the same as
+                # "could not be read", and the difference decides whether a
+                # run can call itself complete.
                 with lock:
-                    q.report.setdefault("skipped_places", {})[
-                        "gmaps/%s" % place] = "no listings returned for this trade"
+                    q.report.setdefault("empty_places", {})[place] = \
+                        "no listings returned for this trade"
         except Blocked as exc:
             # A block is on the ADDRESS, so every other worker is about to hit
             # it too. Stop them all rather than let five more prove the point --
@@ -426,9 +449,7 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
                     "%s Kerb stopped rather than report an empty result." % exc)
             stop.set()
         except Exception as exc:                # noqa: BLE001
-            with lock:
-                q.report.setdefault("skipped_places", {})[
-                    "gmaps/%s" % place] = "%s: %s" % (type(exc).__name__, exc)
+            failed(place, "%s: %s" % (type(exc).__name__, exc))
 
     out: "queue.Queue" = queue.Queue()
     stop = threading.Event()
@@ -474,12 +495,25 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
 
     # Drain as results arrive, so the pipeline can start judging immediately
     # instead of waiting for every place to finish.
-    while any(t.is_alive() for t in threads) or not out.empty():
-        try:
-            yield out.get(timeout=0.2)
-        except queue.Empty:
-            continue
-    for t in threads:
-        t.join(timeout=5)
+    #
+    # The finally is what stops the workers when the CONSUMER stops -- a
+    # request budget, a runtime cap, a tripped breaker, the Stop button. All of
+    # those close this generator, and without the finally the threads carried
+    # on through every remaining place: a run capped at 4 requests went on to
+    # make 40 against Google in the background, which is exactly how an
+    # address gets blocked.
+    finished = False
+    try:
+        while any(t.is_alive() for t in threads) or not out.empty():
+            try:
+                yield out.get(timeout=0.2)
+            except queue.Empty:
+                continue
+        finished = True
+    finally:
+        if not finished:
+            stop.set()
+        for t in threads:
+            t.join(timeout=5)
     if not stop.is_set():
         prof.record_success()

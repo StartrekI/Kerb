@@ -160,7 +160,9 @@ def test_an_unreadable_place_is_reported_not_swallowed():
     q = SourceQuery(what="dentist", places=["Islington"], options={"pause": 0})
     rows = drive(q, handler)
     assert rows == []
-    assert "gmaps/Islington" in (q.report.get("skipped_places") or {}), q.report
+    # Read fine and empty: reported, but NOT as a failure to read.
+    assert "Islington" in (q.report.get("empty_places") or {}), q.report
+    assert "Islington" not in (q.report.get("failed_places") or {}), q.report
     print("  empty place is reported      ok")
 
 
@@ -175,7 +177,7 @@ def test_a_place_that_will_not_geocode_is_reported():
                     options={"pause": 0, "geocode": True})
     rows = drive(q, handler)
     assert len(rows) == 4, "the good place must still be collected"
-    assert "gmaps/Nowhere" in (q.report.get("skipped_places") or {})
+    assert "geocoded" in (q.report.get("failed_places") or {}).get("Nowhere", "")
     print("  ungeocodable place reported  ok")
 
 
@@ -323,6 +325,9 @@ def test_signed_out_is_detected_and_said_out_loud():
     assert looks_signed_in('<div aria-label="Google Account: Sam"></div>')
     assert not looks_signed_in('<a href="/login" aria-label="Sign in">x</a>')
     assert not looks_signed_in("<span>Sign in</span>")
+    # No marker either way -- a consent page, an error page, a redesign -- is
+    # not evidence of a signed-in session. It used to read as signed in.
+    assert not looks_signed_in("<html><body>Before you continue</body></html>")
 
     _fresh_profile()
     prof = session.Profile({}, TEST_PROFILE)
@@ -474,6 +479,130 @@ def test_geocoding_is_off_by_default():
     print("  no geocoding by default      ok")
 
 
+# ----------------------------------------------- through the whole pipeline
+#
+# Every test above reads q.report straight off the source. That is exactly
+# how a block went unnoticed: the source reported it perfectly, and the
+# pipeline -- the only thing a user ever sees -- never read the key. These
+# go the whole way.
+
+def _pipeline_with(handler, **camp):
+    from kerb.campaign import Campaign
+    from kerb.pipeline import Pipeline
+    c = Campaign.from_dict({
+        "sources": [{"id": "gmaps", "options": {"pause": 0, "retries": 1,
+                                                **camp.pop("options", {})}}],
+        "where": {"mode": "paste", "places": camp.pop("places", ["A", "B", "C"])},
+        "what": {"packs": ["trades/dentist"]}, "filters": [], **camp})
+    httpx.Client = lambda **kw: _REAL_CLIENT(transport=httpx.MockTransport(handler))
+    try:
+        pipe = Pipeline(c)
+        out = list(pipe.run())
+    finally:
+        httpx.Client = _REAL_CLIENT
+    return pipe, out
+
+
+def test_a_block_reaches_the_run_not_just_the_source():
+    """The run finished `done`, empty, with no error anywhere -- while the
+    source had written 'Google is rate-limiting this address' into a key
+    nothing read."""
+    from kerb.pipeline import terminal_status
+    _fresh_profile()
+    pipe, out = _pipeline_with(lambda r: httpx.Response(429, text="<html>x</html>"))
+    st = pipe.stats.to_dict()
+    assert out == []
+    assert "rate-limit" in st["source_errors"].get("gmaps", "").lower(), st
+    assert terminal_status(st) == "partial", "an empty blocked run called itself done"
+    _fresh_profile()
+    print("  block reaches the run        ok")
+
+
+def test_a_layout_change_reaches_the_run():
+    from kerb.pipeline import terminal_status
+    _fresh_profile()
+    pipe, _ = _pipeline_with(lambda r: httpx.Response(200, text=')]}\'\n[["q"]]'))
+    st = pipe.stats.to_dict()
+    assert "shape" in st["source_errors"].get("gmaps", "").lower(), st
+    assert terminal_status(st) == "partial"
+    _fresh_profile()
+    print("  shape change reaches run     ok")
+
+
+def test_empty_places_and_notes_reach_the_run():
+    """An empty place is reported but is not a failure; a signed-out note is
+    said to the user instead of being left in a dict."""
+    from kerb.pipeline import terminal_status
+    _fresh_profile()
+    prof = session.Profile({}, TEST_PROFILE)
+    prof.created = 1.0
+    prof.save()
+    pipe, _ = _pipeline_with(lambda r: httpx.Response(200, text=')]}\'\n[["q", []]]'),
+                             places=["Village"])
+    st = pipe.stats.to_dict()
+    assert "gmaps/Village" in st["empty_places"], st
+    assert not st["skipped_places"], "an empty place is not an unreadable one"
+    assert any("signed out" in n for n in st["notes"]), st["notes"]
+    assert terminal_status(st) == "done", "nothing found is a complete answer"
+    _fresh_profile()
+    print("  empty places + notes surface ok")
+
+
+def test_workers_stop_when_the_run_stops():
+    """Closing the source must stop its threads. A run capped at 4 requests
+    used to return after 6 while its workers went on to make 40 in the
+    background -- which is how an address gets blocked."""
+    import threading as _t
+    import time as _time
+    _fresh_profile()
+    calls = {"n": 0}
+    lock = _t.Lock()
+
+    def slow(request):
+        with lock:
+            calls["n"] += 1
+        _time.sleep(0.05)
+        return httpx.Response(200, text=FIXTURE)
+
+    pipe, _ = _pipeline_with(slow, places=["P%02d" % i for i in range(40)],
+                             options={"max_pages": 1},
+                             limits={"max_requests": 4, "workers": {"discover": 4}})
+    at_return = calls["n"]
+    _time.sleep(1.0)
+    assert calls["n"] == at_return, \
+        "workers kept fetching after the run returned (%d -> %d)" % (at_return, calls["n"])
+    assert at_return <= 4 + 4, "one in-flight request per worker at most: %d" % at_return
+    assert "budget" in (pipe.stats.stopped_reason or "")
+    _fresh_profile()
+    print("  workers stop with the run    ok  (%d requests)" % at_return)
+
+
+def test_a_durable_block_halts_and_keeps_the_place():
+    """In durable mode a blocked place was recorded DONE with zero rows, so a
+    resume never went back for it. It must stay queued, and the run stop."""
+    import tempfile as _tf
+    from kerb.store import DONE, PENDING, Store
+    from kerb.sources.durable import collect_places
+    _fresh_profile()
+    db = Store(Path(_tf.mkdtemp()) / "halt.db")
+    run_id = db.create_run({"name": "halt"})
+    httpx.Client = lambda **kw: _REAL_CLIENT(
+        transport=httpx.MockTransport(lambda r: httpx.Response(429, text="<html>x</html>")))
+    try:
+        res = collect_places(db, run_id, "gmaps", ["A", "B", "C"], trade="dentist",
+                             options={"retries": 1, "per_second": 1000}, workers=1)
+    finally:
+        httpx.Client = _REAL_CLIENT
+    counts = db.counts(run_id)
+    assert counts[DONE] == 0, "a blocked place was banked as done: %s" % counts
+    assert counts[PENDING] == 3, counts
+    assert res.stopped and "rate-limit" in res.stopped.lower(), res.stopped
+    assert not db.failures(run_id), "a block is not the place's fault"
+    db.close()
+    _fresh_profile()
+    print("  durable block halts          ok")
+
+
 if __name__ == "__main__":
     print("gmaps -- the collector Kerb runs itself\n")
     for fn in (test_parses_a_real_response,
@@ -499,6 +628,11 @@ if __name__ == "__main__":
                test_one_block_is_recorded_once_not_once_per_worker,
                test_concurrent_profile_saves_do_not_race,
                test_geocoding_is_off_by_default,
-               test_profile_round_trips_and_is_private):
+               test_profile_round_trips_and_is_private,
+               test_a_block_reaches_the_run_not_just_the_source,
+               test_a_layout_change_reaches_the_run,
+               test_empty_places_and_notes_reach_the_run,
+               test_workers_stop_when_the_run_stops,
+               test_a_durable_block_halts_and_keeps_the_place):
         fn()
     print("\nall gmaps checks passed")

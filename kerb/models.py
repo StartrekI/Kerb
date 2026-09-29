@@ -162,6 +162,20 @@ class Signal:
                 "evidence": self.evidence, "version": self.version,
                 "failed": self.failed}
 
+    @classmethod
+    def from_dict(cls, name: str, data: Optional[Dict[str, Any]]) -> "Signal":
+        """A stored measurement, rebuilt. Tolerant: a hand-edited or older row
+        costs precision, never the whole read."""
+        data = data or {}
+        try:
+            conf = float(data.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        return cls(name=name, value=data.get("value"),
+                   confidence=min(1.0, max(0.0, conf)),
+                   evidence=data.get("evidence") or {},
+                   version=int(data.get("version") or 1))
+
 
 class Outcome(str, Enum):
     """What actually happened to a business. Three states, not two.
@@ -264,4 +278,15 @@ class SourceQuery:
     # 50 towns unreachable -- had no way to reach the user: the run simply
     # returned fewer results and looked complete. The pipeline reads this after
     # the source is exhausted and folds it into the run's stats.
+    #
+    # The keys are a contract, and every one of them is read by the pipeline
+    # and by the durable collector. A key a source writes and nobody reads is
+    # how a Google block once reported itself as a clean, empty run.
+    #
+    #   requests       int          HTTP requests made, retries included
+    #   failed_places  {place: why} could not be read; the run is incomplete
+    #   empty_places   {place: why} read fine, and nothing was there
+    #   fatal          str          the source stopped itself; do not trust
+    #                               the rest of its output
+    #   notes          [str]        something the user should know up front
     report: Dict[str, Any] = field(default_factory=dict)

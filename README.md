@@ -8,7 +8,7 @@ No API key. No browser. No other scraper. And when it can't measure something, i
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-000000.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-172%20passing-2C6A4F.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-230%20passing-2C6A4F.svg)](tests/)
 [![Dependencies](https://img.shields.io/badge/dependencies-2-8A5E23.svg)](pyproject.toml)
 [![Self-hosted](https://img.shields.io/badge/data-never%20leaves%20your%20machine-19C9E6.svg)](#legal)
 
@@ -256,7 +256,7 @@ imported from a file **deduplicate against each other for free**.
 | Silence when a source fails | *"3 of 50 towns unreachable"* — before you act on a short list |
 | Zero when it couldn't check | **"never found out"**, in its own bucket |
 | The same 400 rows next week | Suppression: anyone you've dealt with is gone before a request is spent |
-| A fixed set of fields | 14 signals, each with a cost tier — cheap tests run first, so most businesses are decided before anything slow does |
+| A fixed set of fields | 15 signals, each with a cost tier — cheap tests run first, so most businesses are decided before anything slow does |
 
 ---
 
@@ -277,7 +277,7 @@ imported from a file **deduplicate against each other for free**.
 
 ## What it measures
 
-Fourteen signals, in **cost tiers**. Free ones read data already in hand. Paid ones
+Fifteen signals, in **cost tiers**. Free ones read data already in hand. Paid ones
 spend a network request per business and **stay off until you turn them on** —
 Kerb never spends on your behalf.
 
@@ -286,7 +286,7 @@ what has been measured *so far*. The moment a business fails one, it stops. Most
 never reach a paid tier at all.
 
 <details>
-<summary><b>All 14 signals</b> (click to open)</summary>
+<summary><b>All 15 signals</b> (click to open)</summary>
 
 | Signal | Cost | What it asks | Values |
 |---|---|---|---|
@@ -304,6 +304,7 @@ never reach a paid tier at all.
 | `site_status` | **cheap** | Does the website actually load? | live, dead, parked, placeholder, no_site |
 | `site_platform` | **cheap** | What is it built on, read from the HTML | wix, squarespace, shopify, wordpress, … |
 | `site_contact` | **cheap** | Contact details found on the site | text |
+| `reviews_live` | **expensive** | The review count, read from the Maps page (needs `kerb[browser]`) | number |
 
 </details>
 
@@ -576,9 +577,9 @@ silently returns nothing is indistinguishable from a genuinely empty area, and
 that is the exact dishonesty this project exists to remove.
 
 ```bash
-git clone https://github.com/Startrekl/kerb && cd kerb
+git clone https://github.com/StartrekI/Kerb && cd Kerb
 pip install -e ".[server]"
-python3 -m pytest tests/ -q      # 170 tests, all offline
+python3 -m pytest tests/ -q      # 230 tests, all offline
 ```
 
 Tests are offline by design — one runs against a *real* captured response, trimmed

@@ -87,11 +87,42 @@ def _fetcher(ctx: Context, name: str):
     return shared()
 
 
+def _get(ctx: Context, name: str, url: str):
+    """Fetch, and charge what it cost to the run's request budget.
+
+    `Context.note_request` existed and nothing called it, so `max_requests`
+    counted the source's requests and never a single website fetch: a budget
+    of 3 made 20 of them. A fetcher that does not report its cost is charged
+    one request per answer that did not come from a cache.
+    """
+    resp = _fetcher(ctx, name).get(url)
+    spent = getattr(resp, "requests", None)
+    if spent is None:
+        spent = 0 if getattr(resp, "from_cache", False) else 1
+    if spent:
+        ctx.note_request(int(spent))
+    return resp
+
+
 def _parked(url: str, text: str) -> Optional[str]:
-    host = urlsplit(url).netloc.lower()
+    """The parking service this URL landed on, or a parked-page phrase.
+
+    Hosts match on a DOT BOUNDARY, and an entry with a path matches only under
+    that path. A plain substring test made `jordan.com`, `sheridan.com` and
+    `aidan.com` all "parked" on `dan.com` -- a live business reported as having
+    lost its website, which is the most persuasive lead this signal can make.
+    """
+    from ..packs import host_matches
+    parts = urlsplit(url)
+    host = parts.netloc.lower().split("@")[-1].split(":")[0]
+    path = parts.path or "/"
     for p in PARKING:
-        if p.split("/")[0] in host:
-            return p
+        entry_host, _, entry_path = p.partition("/")
+        if not host_matches(host, [entry_host]):
+            continue
+        if entry_path and not path.lstrip("/").startswith(entry_path):
+            continue
+        return p
     low = text[:4000].lower()
     for p in ("this domain may be for sale", "buy this domain",
               "domain is for sale", "parked free, courtesy"):
@@ -112,7 +143,7 @@ def site_status(biz: Business, ctx: Context) -> Signal:
         return Signal("site_status", "no_site", 1.0,
                       {"note": "the listing gives no website to check"})
 
-    resp = _fetcher(ctx, "site_status").get(url)
+    resp = _get(ctx, "site_status", url)
 
     if resp.error:
         # A fetch that failed is NOT evidence the site is dead -- our network
@@ -168,7 +199,7 @@ def site_platform(biz: Business, ctx: Context) -> Signal:
     if not url:
         return Signal("site_platform", None, 1.0, {"note": "no website to inspect"})
 
-    resp = _fetcher(ctx, "site_platform").get(url)
+    resp = _get(ctx, "site_platform", url)
     if resp.error:
         return Signal("site_platform", "unknown", 0.0, {"error": resp.error, "url": url})
     if not resp.ok:
@@ -198,7 +229,7 @@ def site_contact(biz: Business, ctx: Context) -> Signal:
     if not url:
         return Signal("site_contact", None, 1.0, {"note": "no website to read"})
 
-    resp = _fetcher(ctx, "site_contact").get(url)
+    resp = _get(ctx, "site_contact", url)
     if resp.error:
         return Signal("site_contact", "unknown", 0.0, {"error": resp.error, "url": url})
     if not resp.ok:

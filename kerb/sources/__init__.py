@@ -45,6 +45,10 @@ class RegisteredSource:
     # What to use instead, when the source cannot supply something. Lets the UI
     # offer a way forward rather than only a refusal.
     instead: dict = None
+    # The environment variable a keyed source reads its key from. The UI names
+    # it in the "set this up first" notice; it used to hard-code one variable
+    # name for every keyed source, belonging to a source that does not exist.
+    key_env: str = ""
 
 
 _SOURCES: Dict[str, RegisteredSource] = {}
@@ -53,14 +57,16 @@ _SOURCES: Dict[str, RegisteredSource] = {}
 def source(id: str, label: str = "", description: str = "",
            needs_key: bool = False, needs_browser: bool = False,
            legal_note: str = "", takes: str = "places",
-           cannot_measure: tuple = (), instead: dict = None):
+           cannot_measure: tuple = (), instead: dict = None,
+           key_env: str = ""):
     def wrap(fn):
         _SOURCES[id] = RegisteredSource(
             fn=fn, id=id, label=label or id,
             description=description or (fn.__doc__ or "").strip().split("\n")[0],
             needs_key=needs_key, needs_browser=needs_browser,
             legal_note=legal_note, takes=takes,
-            cannot_measure=tuple(cannot_measure), instead=dict(instead or {}))
+            cannot_measure=tuple(cannot_measure), instead=dict(instead or {}),
+            key_env=key_env)
         return fn
     return wrap
 

@@ -346,6 +346,81 @@ def test_the_limiter_is_shared_not_per_worker():
     store.close()
 
 
+def test_two_connections_never_claim_the_same_task():
+    """claim() is now select-then-update (RETURNING needs SQLite 3.35, older
+    than Python 3.9 ships on common systems). Two connections -- as two
+    processes would have -- must still never take the same task."""
+    import threading
+    db = TMP / "twoconn.db"
+    a, b = Store(db), Store(db)
+    run_id = a.create_run({"name": "two"})
+    a.add_tasks(run_id, "k", ["u%03d" % i for i in range(300)])
+    got = {"a": [], "b": []}
+    # Both start together, and each yields after every claim: without that one
+    # thread can drain the queue before the other is scheduled, and nothing
+    # was contended -- so nothing was tested.
+    gate = threading.Barrier(2)
+
+    def drain(store, key):
+        gate.wait()
+        while True:
+            t = store.claim(run_id)
+            if t is None:
+                return
+            got[key].append(t["key"])
+            time.sleep(0.0005)
+
+    ts = [threading.Thread(target=drain, args=(a, "a")),
+          threading.Thread(target=drain, args=(b, "b"))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    claimed = got["a"] + got["b"]
+    assert len(claimed) == 300 and len(set(claimed)) == 300, \
+        "%d claims, %d distinct" % (len(claimed), len(set(claimed)))
+    assert got["a"] and got["b"], "one connection never got a turn"
+    a.close()
+    b.close()
+    print("  claims are exclusive      ok  (%d/%d split)" % (len(got["a"]), len(got["b"])))
+
+
+def test_a_durable_cli_run_keeps_its_counts():
+    """The CLI saved the qualified/rejected counts, then overwrote them a few
+    lines later with the collector's own stats."""
+    import json as _json
+    from unittest import mock
+    import httpx
+    from kerb import cli
+
+    def request(self, method, url, **kw):
+        if "nominatim" in str(url):
+            return httpx.Response(200, json=[{"boundingbox": ["1", "2", "3", "4"]}],
+                                  request=httpx.Request("GET", "x"))
+        return httpx.Response(200, json={"elements": [
+            {"type": "node", "id": i, "lat": 1.5, "lon": 3.5,
+             "tags": {"name": "Roofer %d" % i, "craft": "roofer"}} for i in range(3)]},
+            request=httpx.Request("POST", "x"))
+
+    camp = TMP / "durable.yaml"
+    camp.write_text("name: dur\nsources: [{id: overpass, options: {pause: 0, per_second: 1000}}]\n"
+                    "where: {places: [Somewhere]}\nwhat: {packs: [trades/roofing]}\n")
+    db = TMP / "durable-cli.db"
+    out = TMP / "durable-out.json"
+    with mock.patch.object(httpx.Client, "request", request), \
+            mock.patch("time.sleep", lambda *a: None):
+        code = cli.main(["run", str(camp), "--durable", "--state-db", str(db),
+                         "--out", str(out), "--include-rejected", "-q"])
+    assert code == 0, code
+    store = Store(db)
+    run = store.list_runs()[0]
+    stats = _json.loads(run["stats"])
+    store.close()
+    assert stats.get("qualified") == 3 and stats.get("total") == 3, stats
+    assert len(_json.loads(out.read_text())["results"]) == 3
+    print("  durable counts survive    ok")
+
+
 if __name__ == "__main__":
     print("durability — kill it and prove nothing was lost\n")
     for fn in (test_kill_9_loses_nothing_and_duplicates_nothing,
@@ -358,6 +433,8 @@ if __name__ == "__main__":
                test_one_bad_unit_does_not_cost_the_others,
                test_the_breaker_stops_a_collection_gone_bad,
                test_throttling_slows_the_shared_limiter,
-               test_the_limiter_is_shared_not_per_worker):
+               test_the_limiter_is_shared_not_per_worker,
+               test_two_connections_never_claim_the_same_task,
+               test_a_durable_cli_run_keeps_its_counts):
         fn()
     print("\nall durability checks passed")

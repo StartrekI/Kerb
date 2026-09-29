@@ -127,6 +127,17 @@ class Fatal(Exception):
     """
 
 
+class Halt(RuntimeError):
+    """Stop the whole collection, and give this unit back untouched.
+
+    For trouble that is about the SOURCE rather than the unit: a block on the
+    address, a response shape the parser no longer understands. Every other
+    unit would hit it too, so grinding on only burns attempts -- and marking
+    the unit done or failed would lose it. It goes back to the queue, and a
+    resume picks it up once the cause has passed.
+    """
+
+
 ProgressFn = Callable[[Dict[str, Any]], None]
 FetchFn = Callable[[str, Dict[str, Any]], Iterable[Business]]
 
@@ -180,6 +191,14 @@ def collect(store: Store, run_id: str, kind: str, units: Iterable[str],
                 limiter.acquire()
                 rows = [b.to_dict() if isinstance(b, Business) else b
                         for b in fetch(unit, ctx)]
+            except Halt as exc:
+                store.release(task["id"])
+                with lock:
+                    if not result.stopped:
+                        result.stopped = str(exc)
+                stop.set()
+                on_progress({"stage": "halt", "unit": unit, "reason": str(exc)})
+                return
             except Fatal as exc:
                 store.fail(task["id"], "%s: %s" % (type(exc).__name__, exc),
                            max_attempts=1)
@@ -242,7 +261,10 @@ def collect(store: Store, run_id: str, kind: str, units: Iterable[str],
         result.stopped = result.stopped or "interrupted"
 
     result.health = health.summary() if health.counts else {}
-    result.failures = store.failures(run_id)
+    # This collection's failures only. The run may hold other kinds of task --
+    # a requalify pass, a second source -- and counting theirs here would
+    # blame this collection for work it never did.
+    result.failures = [f for f in store.failures(run_id) if f.get("kind") == kind]
     result.units_failed = len(result.failures)
     return result
 

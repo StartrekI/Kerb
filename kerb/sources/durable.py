@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 from .. import sources
-from ..collect import (DEFAULT_WORKERS, CollectResult, Fatal, RateLimiter,
+from ..collect import (DEFAULT_WORKERS, CollectResult, Fatal, Halt, RateLimiter,
                        collect)
 from ..models import Business, SourceQuery
 from ..store import Store
@@ -46,12 +46,22 @@ def _fetch_one_place(source_id: str, trade: Optional[str],
     retrying it four times just delays the run and annoys the endpoint.
     """
     def fetch(place: str, ctx: Dict[str, Any]) -> Iterator[Business]:
-        query = SourceQuery(what=trade, places=[place], options=options)
-        found = 0
+        # The collector's limiter goes to the source, so a source that makes
+        # several requests per place (pages) paces every one of them, not only
+        # the first. `pause` is 0 here precisely because this limiter exists.
+        opts = dict(options)
+        if ctx.get("limiter") is not None:
+            opts["_limiter"] = ctx["limiter"]
+        query = SourceQuery(what=trade, places=[place], options=opts)
         for biz in sources.fetch(source_id, query):
-            found += 1
             yield biz
-        failed = query.report.get("failed_places") or {}
+        report = query.report
+        if report.get("fatal"):
+            # The source stopped itself -- a block, a shape it cannot parse.
+            # Recording this place as done would bank an empty result for it
+            # permanently; Halt stops the run and hands the place back.
+            raise Halt(report["fatal"])
+        failed = report.get("failed_places") or {}
         if place in failed:
             why = failed[place]
             if "geocoded" in why:

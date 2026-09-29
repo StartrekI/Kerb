@@ -269,6 +269,103 @@ def test_exclude_and_dedupe_apply_to_every_mode():
     print("  exclude and dedupe       ok")
 
 
+def test_place_packs_work_without_a_mode():
+    """`where: {packs: [...]}` -- the form CUSTOMIZATION.md shows -- validated
+    clean and then searched zero places, because places were chosen by `mode`
+    and validation looked at the keys."""
+    from kerb.campaign import validate
+    no_mode = Campaign.from_dict({"where": {"packs": ["geo/uk-affluent"]}})
+    assert len(no_mode.places) == 20, len(no_mode.places)
+    both = Campaign.from_dict({"where": {"places": ["Leeds"],
+                                         "packs": ["geo/uk-affluent"],
+                                         "place": "York"}})
+    assert both.places[0] == "Leeds" and both.places[-1] == "York"
+    assert len(both.places) == 22, "places, packs and place are a union"
+    assert validate({"sources": [{"id": "overpass"}], "what": {"trade": "x"},
+                     "where": {"packs": ["geo/uk-affluent"]}}) == []
+    print("  place packs without mode ok")
+
+
+def test_custom_trade_is_actually_checked():
+    """`what.custom.label` was used as the search term and nowhere else, so
+    trade_match had no pack, answered "unknown", and `!= false` passed every
+    business -- pizza restaurants included."""
+    c = Campaign.from_dict({"what": {"custom": {"label": "Bakery"}},
+                            "where": {"place": "X"},
+                            "filters": [{"signal": "trade_match", "op": "!=",
+                                         "value": False}]})
+    rows = [Business(cid="0x3:0x1", name="Crumbs", category="Bakery"),
+            Business(cid="0x3:0x2", name="Luigi's", category="Pizza restaurant")]
+    got = {v.business.name: v.outcome.value for v in Pipeline(c).qualify(rows)}
+    assert got == {"Crumbs": "qualified", "Luigi's": "rejected"}, got
+    print("  custom trade checked     ok")
+
+
+def test_pack_osm_tags_reach_the_source():
+    """`what.osm_tags` was parsed into the typed pack and never passed on, while
+    the overpass error message told users to set exactly that."""
+    from unittest import mock
+    import httpx
+    seen = []
+
+    def request(self, method, url, **kw):
+        if "nominatim" in str(url):
+            return httpx.Response(200, json=[{"boundingbox": ["1", "2", "3", "4"]}],
+                                  request=httpx.Request("GET", "x"))
+        seen.append((kw.get("data") or {}).get("data", ""))
+        return httpx.Response(200, json={"elements": []},
+                              request=httpx.Request("POST", "x"))
+
+    c = Campaign.from_dict({"sources": [{"id": "overpass", "options": {"pause": 0}}],
+                            "where": {"places": ["Somewhere"]},
+                            "what": {"trade": "bouldering gyms",
+                                     "osm_tags": ["sport=climbing"]}})
+    with mock.patch.object(httpx.Client, "request", request), \
+            mock.patch("time.sleep", lambda *a: None):
+        list(Pipeline(c).run())
+    assert seen and '["sport"="climbing"]' in seen[0], seen
+    assert "bouldering" not in seen[0], "the guessed tags were used instead"
+    print("  pack osm_tags used       ok")
+
+
+def test_rejudging_reuses_paid_measurements():
+    """`requalify` promised no re-collection, then recomputed every signal --
+    refetching every website it had already checked. FREE signals are
+    recomputed (that is where a changed rule lands); paid ones are reused."""
+    from kerb.fetch import Response
+    from kerb.pipeline import stored_signals
+
+    class Counting:
+        n = 0
+
+        def get(self, url):
+            Counting.n += 1
+            return Response(url=url, final_url=url, status=404, text="gone",
+                            requests=1)
+
+    data = write("rejudge.csv", "cid,title,category,review_count,website\n"
+                                "0xd:0x1,Dead Site Dental,Dentist,90,https://d.example/\n"
+                                "0xd:0x2,Tiny Dental,Dentist,4,https://t.example/\n")
+    base = {"sources": [{"id": "csv", "options": {"path": str(data)}}],
+            "what": {"packs": ["trades/dentist"]},
+            "filters": [{"signal": "site_status", "op": "==", "value": "dead"}],
+            "signal_options": {"site_status": {"fetcher": Counting()}}}
+    first = [v.to_dict() for v in Pipeline(Campaign.from_dict(base)).run()]
+    fetched = Counting.n
+    assert fetched == 2
+
+    tighter = {**base, "filters": base["filters"] +
+               [{"signal": "reviews", "op": ">=", "value": 30}]}
+    businesses = [Business(**{k: v for k, v in r.items()
+                              if k in Business.__dataclass_fields__}) for r in first]
+    again = {v.business.name: v.outcome.value for v in
+             Pipeline(Campaign.from_dict(tighter), reuse=stored_signals(first))
+             .qualify(businesses)}
+    assert Counting.n == fetched, "re-judging fetched %d more pages" % (Counting.n - fetched)
+    assert again == {"Dead Site Dental": "qualified", "Tiny Dental": "rejected"}, again
+    print("  re-judging reuses paid   ok")
+
+
 # ------------------------------------------------------- confidence weighting
 
 def test_confidence_weighting_is_opt_in_and_real():
@@ -299,6 +396,10 @@ if __name__ == "__main__":
                test_suppression_is_always_reported,
                test_place_order,
                test_exclude_and_dedupe_apply_to_every_mode,
+               test_place_packs_work_without_a_mode,
+               test_custom_trade_is_actually_checked,
+               test_pack_osm_tags_reach_the_source,
+               test_rejudging_reuses_paid_measurements,
                test_confidence_weighting_is_opt_in_and_real):
         fn()
     print("\nall memory checks passed")

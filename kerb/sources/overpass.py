@@ -28,7 +28,7 @@ from . import source
 
 OVERPASS = "https://overpass-api.de/api/interpreter"
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
-UA = "kerb/0.1 (open-source local business qualification; +https://github.com/kerb)"
+UA = "kerb/0.1 (open-source local business qualification; +https://github.com/StartrekI/Kerb)"
 
 ATTRIBUTION = "© OpenStreetMap contributors"
 

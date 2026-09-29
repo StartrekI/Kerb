@@ -17,10 +17,12 @@ from ..models import Business, Cost, Signal
 from . import Context, signal
 
 
+# The value is a YEAR, so it filters ("listed since 2020") but does not rank:
+# weighted as a magnitude, every business with any year scored full marks.
 @signal(name="establishment_age", cost=Cost.FREE, version=1,
-        label="Establishment age",
-        description="Oldest-review year as a listing-age proxy",
-        kind="number")
+        label="First review year",
+        description="Oldest-review year, a proxy for how long it has been listed",
+        kind="number", rank=False)
 def establishment_age(biz: Business, ctx: Context) -> Signal:
     year = biz.first_review_year
     if not year:

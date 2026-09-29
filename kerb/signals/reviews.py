@@ -23,7 +23,8 @@ PAGE_SIZE = 5
 
 @signal(name="reviews", cost=Cost.FREE, version=1,
         label="Review count", description="How many reviews the listing claims",
-        kind="number", suggest={"op": ">=", "value": 30, "default_on": True})
+        kind="number", suggest={"op": ">=", "value": 30, "default_on": True},
+        rank={"scale": "log", "cap": 300})
 def reviews(biz: Business, ctx: Context) -> Signal:
     n = biz.review_count
     if n is None:

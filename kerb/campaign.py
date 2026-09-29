@@ -93,7 +93,12 @@ class Campaign:
             limits=Limits(
                 max_results=lim.get("max_results"),
                 max_requests=lim.get("max_requests"),
-                max_runtime_seconds=parse_duration(lim.get("max_runtime")),
+                # Both spellings. The UI and the README write
+                # `max_runtime_seconds`; this read only `max_runtime`, so the
+                # runtime cap anyone actually set was silently dropped.
+                max_runtime_seconds=parse_duration(
+                    lim["max_runtime_seconds"] if "max_runtime_seconds" in lim
+                    else lim.get("max_runtime")),
                 workers={**{"discover": 6, "profile": 6}, **(lim.get("workers") or {})},
                 breaker=lim.get("breaker") or {},
                 attempts=lim.get("attempts"),
@@ -118,7 +123,7 @@ class Campaign:
         what it asked for.
         """
         packs = list(self.what.get("packs") or [])
-        if self.what.get("trade") and ADHOC_ID not in packs:
+        if self._typed_term() and ADHOC_ID not in packs:
             # A trade typed into the brief is wired exactly like a shipped one,
             # so nothing downstream needs to know which it was.
             packs.append(ADHOC_ID)
@@ -129,6 +134,19 @@ class Campaign:
             opts.setdefault("match", self.what.get("match", "any"))
             self.signal_options["trade_match"] = opts
 
+    def _typed_term(self) -> Optional[str]:
+        """The trade this campaign typed rather than picked from a pack.
+
+        `what.custom` is the older spelling of the same thing. It used to be
+        read for the search term and nowhere else, so trade_match had no pack to
+        check against, answered "unknown" -- and `trade_match != false` passed
+        every business, pizza restaurants included.
+        """
+        term = self.what.get("trade")
+        if not term:
+            term = (self.what.get("custom") or {}).get("label")
+        return str(term) if term else None
+
     @property
     def typed_pack(self):
         """The ad-hoc trade pack this campaign defines, if it typed one.
@@ -136,14 +154,15 @@ class Campaign:
         Returns a plain dict so the caller decides which library it joins --
         never the process-wide one, which the server shares across campaigns.
         """
-        term = self.what.get("trade")
+        term = self._typed_term()
         if not term:
             return None
+        source = self.what if self.what.get("trade") else (self.what.get("custom") or {})
         return adhoc_trade(term, {
-            "categories": self.what.get("categories"),
-            "keywords": self.what.get("keywords"),
-            "vetoes": self.what.get("vetoes"),
-            "osm_tags": self.what.get("osm_tags"),
+            "categories": source.get("categories"),
+            "keywords": source.get("keywords"),
+            "vetoes": source.get("vetoes"),
+            "osm_tags": source.get("osm_tags"),
         })
 
     # -- derived ---------------------------------------------------------
@@ -158,21 +177,23 @@ class Campaign:
         hand-rolled reordering scripts in the predecessor say so.
         """
         from .packs import library
-        mode = self.where.get("mode", "search")
         out: List[str] = []
 
-        if mode == "paste" or "places" in self.where:
-            out = [p for p in (self.where.get("places") or []) if p]
-        elif mode == "packs":
-            lib = library()
-            for pid in self.where.get("packs") or []:
-                pack = lib.maybe(pid)
-                if not pack:
-                    continue
-                for entry in pack.get("places") or []:
-                    out.append(entry["name"] if isinstance(entry, dict) else str(entry))
-        elif self.where.get("place"):
-            out = [self.where["place"]]
+        # Every way of naming places counts, whatever `mode` says. The places
+        # used to be chosen BY mode, so `where: {packs: [geo/uk-affluent]}` --
+        # the form CUSTOMIZATION.md shows -- validated clean (validation looked
+        # at the keys) and then searched nothing at all (this looked at mode).
+        # Listing places, packs and a single place together is a union.
+        out += [str(p) for p in (self.where.get("places") or []) if p]
+        lib = library()
+        for pid in self.where.get("packs") or []:
+            pack = lib.maybe(pid)
+            if not pack:
+                continue                    # validate() reports the unknown id
+            for entry in pack.get("places") or []:
+                out.append(entry["name"] if isinstance(entry, dict) else str(entry))
+        if self.where.get("place"):
+            out.append(str(self.where["place"]))
 
         # Exclusions apply however the places were expressed, so a pack can be
         # taken wholesale and trimmed rather than copied and edited.
@@ -289,7 +310,7 @@ class Campaign:
             "limits": {
                 "max_results": self.limits.max_results,
                 "max_requests": self.limits.max_requests,
-                "max_runtime": self.limits.max_runtime_seconds,
+                "max_runtime_seconds": self.limits.max_runtime_seconds,
                 "workers": self.limits.workers,
                 "breaker": self.limits.breaker,
                 "attempts": self.limits.attempts,
@@ -355,88 +376,300 @@ def check_output(cfg: Dict[str, Any]) -> List[str]:
     return problems
 
 
+# Every key a campaign may carry, per section. A key outside these is a
+# problem, not a silence: `max_runtime_seconds` was once ignored for months
+# because nothing said the reader only knew `max_runtime`. CUSTOMIZATION.md
+# names the rule -- something must fail if a key is misspelled.
+CAMPAIGN_KEYS = {"name", "description", "sources", "where", "what", "filters",
+                 "scoring", "gating", "limits", "output", "suppress",
+                 "signal_options"}
+WHERE_KEYS = {"mode", "places", "packs", "place", "exclude", "order",
+              "priority", "seed"}
+WHAT_KEYS = {"packs", "trade", "match", "categories", "keywords", "vetoes",
+             "osm_tags", "custom"}
+SCORING_KEYS = {"weights", "normalise", "confidence", "bands"}
+LIMIT_KEYS = {"max_results", "max_requests", "max_runtime",
+              "max_runtime_seconds", "workers", "breaker", "attempts"}
+SUPPRESS_KEYS = {"lists", "cids", "runs", "after"}
+OUTPUT_KEYS = {"columns", "template", "min_score", "top", "split_by", "sort"}
+BREAKER_KEYS = {"rate", "window", "min_sample"}
+TIERS = {c.value for c in Cost}
+WHERE_MODES = {"paste", "packs", "search"}
+ORDERS = {"as-listed", "", "none", "alphabetical", "random", "priority"}
+
+
+def _unknown(section: str, got: Dict[str, Any], allowed: set) -> List[str]:
+    return ["%s%s is not a setting Kerb reads (known: %s)"
+            % (section, k, ", ".join(sorted(allowed)))
+            for k in got if k not in allowed]
+
+
+def _source_id(spec) -> Optional[str]:
+    """`{id: csv, options: ...}` or the bare string `csv` -- the pipeline takes both."""
+    if isinstance(spec, dict):
+        return spec.get("id")
+    if isinstance(spec, str):
+        return spec
+    return None
+
+
+def _positive_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def check_rules(rules, known_signals: set, where: str = "filters") -> List[str]:
+    """Problems with a filter list, groups included. Never raises.
+
+    An unknown operator used to pass validation and then raise inside the
+    pipeline, killing the run on its first business.
+    """
+    from .scoring import ORDERING, OPS
+    if rules is None:
+        return []
+    if not isinstance(rules, list):
+        return ["%s must be a list of conditions" % where]
+    problems: List[str] = []
+    for i, rule in enumerate(rules):
+        label = "%s[%d]" % (where, i)
+        if not isinstance(rule, dict):
+            problems.append("%s must be a mapping like {signal, op, value}" % label)
+            continue
+        if "group" in rule:
+            if rule.get("group") not in ("any", "all"):
+                problems.append("%s.group must be 'any' or 'all', got %r"
+                                % (label, rule.get("group")))
+            problems.extend(check_rules(rule.get("of") or [], known_signals,
+                                        label + ".of"))
+            continue
+        name = str(rule.get("signal") or "").split(".")[0]
+        if not name:
+            problems.append("%s names no signal" % label)
+        elif name not in known_signals:
+            problems.append("filter refers to unknown signal %r" % name)
+        op = rule.get("op", "==")
+        if op not in OPS and op not in ORDERING:
+            problems.append("%s uses operator %r; use one of %s"
+                            % (label, op, ", ".join(list(OPS) + list(ORDERING))))
+    return problems
+
+
+def check_limits(lim) -> List[str]:
+    if lim is None:
+        return []
+    if not isinstance(lim, dict):
+        return ["limits must be a mapping"]
+    problems = _unknown("limits.", lim, LIMIT_KEYS)
+    for key in ("max_results", "max_requests", "attempts"):
+        if key in lim and lim[key] is not None and not _positive_int(lim[key]):
+            # Zero is refused rather than read as "no cap": the pipeline has
+            # always treated 0 as unset, and a user writing 0 means something.
+            problems.append("limits.%s must be a whole number above 0, or left out"
+                            % key)
+    if "max_runtime" in lim and "max_runtime_seconds" in lim \
+            and parse_duration(lim["max_runtime"]) != parse_duration(lim["max_runtime_seconds"]):
+        problems.append("limits sets both max_runtime and max_runtime_seconds "
+                        "to different values; keep one")
+    for key in ("max_runtime", "max_runtime_seconds"):
+        if key in lim and lim[key] is not None:
+            secs = parse_duration(lim[key])
+            if secs is None or secs <= 0:
+                problems.append("limits.%s must be a positive duration like "
+                                "1800 or 30m, got %r" % (key, lim[key]))
+    workers = lim.get("workers")
+    if workers is not None:
+        if not isinstance(workers, dict):
+            problems.append("limits.workers must be a mapping like {discover: 3}")
+        else:
+            for k, v in workers.items():
+                if not _positive_int(v):
+                    problems.append("limits.workers.%s must be a whole number above 0" % k)
+    breaker = lim.get("breaker")
+    if breaker is not None:
+        if not isinstance(breaker, dict):
+            problems.append("limits.breaker must be a mapping of rate, window, min_sample")
+        else:
+            problems.extend(_unknown("limits.breaker.", breaker, BREAKER_KEYS))
+    return problems
+
+
+def durable_problem(campaign: "Campaign") -> Optional[str]:
+    """Why this campaign cannot run durably, or None.
+
+    A durable run makes each place a unit of work, from ONE source. It used to
+    take the first source silently -- dropping any others -- and would try to
+    run a file source place by place, which fails every unit.
+    """
+    from . import sources as src
+    if not campaign.places:
+        return ("a durable run needs places -- it makes each one a unit of work. "
+                "A file source is a single unit; run it normally.")
+    ids = [_source_id(s) for s in campaign.sources
+           if not (isinstance(s, dict) and s.get("enabled") is False)]
+    if len(ids) != 1:
+        return ("a durable run collects from exactly one source; this campaign "
+                "lists %d (%s)" % (len(ids), ", ".join(map(str, ids))))
+    try:
+        takes = src.get(ids[0]).takes
+    except KeyError:
+        return "unknown source %r" % ids[0]
+    if takes == "path":
+        return ("%s reads a file, which is a single unit of work; run it "
+                "normally rather than durably" % ids[0])
+    return None
+
+
 def validate(d: Dict[str, Any]) -> List[str]:
     """Problems a user can fix, in their words. Empty list means valid.
 
     Deliberately returns everything wrong at once rather than raising on the
     first fault -- a builder that reveals one error per attempt is a bad tool.
+    And it never raises: a malformed campaign sent over HTTP used to answer
+    500 from here instead of saying what was wrong with it.
     """
     from . import signals as sig
     from . import sources as src
     from .packs import library
+    from .scoring import check_bands, check_weight
 
-    problems: List[str] = []
+    if not isinstance(d, dict):
+        return ["a campaign must be a mapping of settings"]
+    problems: List[str] = _unknown("", d, CAMPAIGN_KEYS)
     lib = library()
 
-    for s in d.get("sources") or []:
-        sid = s.get("id") if isinstance(s, dict) else s
+    def section(key: str, allowed: Optional[set] = None) -> Dict[str, Any]:
+        value = d.get(key)
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            problems.append("%s must be a mapping" % key)
+            return {}
+        if allowed is not None:
+            problems.extend(_unknown(key + ".", value, allowed))
+        return value
+
+    where = section("where", WHERE_KEYS)
+    what = section("what", WHAT_KEYS)
+    scoring = section("scoring", SCORING_KEYS)
+    suppress = section("suppress", SUPPRESS_KEYS)
+    output = section("output", OUTPUT_KEYS)
+    gating = section("gating", TIERS)
+
+    # -- sources --------------------------------------------------------
+    raw_sources = d.get("sources")
+    if raw_sources is not None and not isinstance(raw_sources, list):
+        problems.append("sources must be a list, like [{id: csv, options: {path: x.csv}}]")
+        raw_sources = []
+    # Mirror from_dict's default: no sources means overpass.
+    specs = raw_sources or [{"id": "overpass"}]
+    registered = []
+    for spec in specs:
+        sid = _source_id(spec)
+        if not sid:
+            problems.append("each source needs an id, got %r" % (spec,))
+            continue
         try:
-            src.get(sid)
+            reg = src.get(sid)
         except KeyError:
             problems.append("unknown source %r" % sid)
+            continue
+        registered.append((spec, reg))
+        # A source that cannot start is a problem you want at validation time,
+        # not forty places into a run.
+        opts = (spec.get("options") if isinstance(spec, dict) else None) or {}
+        if not isinstance(opts, dict):
+            problems.append("sources[%s].options must be a mapping" % sid)
+        elif reg.takes == "path" and not str(opts.get("path") or "").strip():
+            problems.append("%s needs a file: set options.path" % sid)
 
-    # A source that cannot start is a problem you want at validation time, not
-    # forty places into a run.
-    for entry in (d.get("sources") or []):
-        sid = (entry or {}).get("id")
+    place_based = [reg for _, reg in registered if reg.takes != "path"]
+    # An unrecognised source is treated as place-based for the places check,
+    # so a typo in the id does not also hide the missing places.
+    unknown_ids = len(specs) - len(registered)
 
-    what = d.get("what") or {}
+    # -- what -----------------------------------------------------------
+    custom = what.get("custom") or {}
     named = bool(what.get("packs") or what.get("trade")
-                 or (what.get("custom") or {}).get("label"))
+                 or (isinstance(custom, dict) and custom.get("label")))
     if isinstance(what.get("trade"), str) and not what["trade"].strip():
         problems.append("what.trade is empty -- name the trade to look for.")
         named = False
+    if what.get("match") not in (None, "any", "all"):
+        problems.append("what.match must be 'any' or 'all', got %r" % what.get("match"))
+    packs = what.get("packs") or []
+    if not isinstance(packs, list):
+        problems.append("what.packs must be a list")
+        packs = []
+    for pid in packs:
+        if pid not in lib:
+            problems.append("unknown trade pack %r" % pid)
+
     if not named:
         # Only a campaign that actually NEEDS a trade is missing one. Scoring a
         # file purely on reviews and web presence is a legitimate brief with no
         # trade in it at all.
-        by_filter = any((f or {}).get("signal") == "trade_match"
-                        for f in (d.get("filters") or []))
-        by_weight = "trade_match" in ((d.get("scoring") or {}).get("weights") or {})
-        # A source that searches by trade cannot even build its query without
-        # one; it raises at collection time, which is far too late to hear it.
-        from . import sources as _src
-        searches = [x for x in (d.get("sources") or [{"id": "overpass"}])
-                    if _src.get((x or {}).get("id") or "overpass").takes != "path"]
+        filters_ = d.get("filters") if isinstance(d.get("filters"), list) else []
+        by_filter = any(isinstance(f, dict) and f.get("signal") == "trade_match"
+                        for f in filters_)
+        by_weight = "trade_match" in (scoring.get("weights") or {}) \
+            if isinstance(scoring.get("weights"), dict) else False
         if by_filter or by_weight:
             problems.append(
                 "what: name a trade -- pick a pack or type one (what.trade: hospitals). "
                 "trade_match is in use and has nothing to check against.")
-        elif searches:
+        elif place_based:
+            # A source that searches by trade cannot even build its query
+            # without one; it raises at collection time, far too late to hear.
             problems.append(
                 "what: name a trade -- pick a pack or type one (what.trade: hospitals). "
                 "%s searches by trade and cannot build a query without one."
-                % (searches[0].get("id") or "that source"))
+                % place_based[0].id)
 
-    for pid in (d.get("what") or {}).get("packs") or []:
-        if pid not in lib:
-            problems.append("unknown trade pack %r" % pid)
-    for pid in (d.get("where") or {}).get("packs") or []:
+    # -- where ----------------------------------------------------------
+    place_packs = where.get("packs") or []
+    if not isinstance(place_packs, list):
+        problems.append("where.packs must be a list")
+        place_packs = []
+    for pid in place_packs:
         if pid not in lib:
             problems.append("unknown place pack %r" % pid)
-
-    known = {r.name for r in sig.all_signals()}
-    for rule in d.get("filters") or []:
-        if "group" in rule:
-            continue
-        name = (rule.get("signal") or "").split(".")[0]
-        if name and name not in known:
-            problems.append("filter refers to unknown signal %r" % name)
-    from .scoring import check_bands, check_weight
-    problems.extend(check_bands((d.get("scoring") or {}).get("bands")))
-    problems.extend(check_output((d.get("output") or {})))
-    for name, spec in (((d.get("scoring") or {}).get("weights")) or {}).items():
-        if name.split(".")[0] not in known:
-            problems.append("scoring refers to unknown signal %r" % name)
-        problems.extend(check_weight(name, spec))
-
-    where = d.get("where") or {}
-    if not (where.get("places") or where.get("packs") or where.get("place")):
-        # Mirror from_dict's default: no sources means overpass, which needs
-        # places. Reading the empty list literally made `any([])` false, so an
-        # empty sources list validated clean and then found nothing at runtime.
-        srcs = d.get("sources") or [{"id": "overpass"}]
-        if any((s.get("id") if isinstance(s, dict) else s) not in ("csv", "gosom")
-               for s in srcs):
+    if where.get("mode") not in (None,) and where.get("mode") not in WHERE_MODES:
+        problems.append("where.mode must be one of %s, got %r"
+                        % (", ".join(sorted(WHERE_MODES)), where.get("mode")))
+    if str(where.get("order", "as-listed")).lower() not in ORDERS:
+        problems.append("where.order must be as-listed, priority, alphabetical or "
+                        "random; got %r" % where.get("order"))
+    if not (where.get("places") or place_packs or where.get("place")):
+        if place_based or unknown_ids:
             problems.append("no places given -- set where.places, where.packs or where.place")
+
+    # -- conditions and ranking -------------------------------------------
+    known = {r.name for r in sig.all_signals()}
+    problems.extend(check_rules(d.get("filters"), known))
+    problems.extend(check_bands(scoring.get("bands")))
+    weights = scoring.get("weights")
+    if weights is not None and not isinstance(weights, dict):
+        problems.append("scoring.weights must be a mapping of signal -> weight")
+    else:
+        for name, spec in (weights or {}).items():
+            if str(name).split(".")[0] not in known:
+                problems.append("scoring refers to unknown signal %r" % name)
+            problems.extend(check_weight(name, spec))
+
+    for tier, names in gating.items():
+        if not isinstance(names, list):
+            problems.append("gating.%s must be a list of signal names" % tier)
+            continue
+        for name in names:
+            if name not in known:
+                problems.append("gating.%s names unknown signal %r" % (tier, name))
+
+    # -- the rest ---------------------------------------------------------
+    problems.extend(check_limits(d.get("limits")))
+    problems.extend(check_output(output))
+    for key in ("lists", "cids", "runs"):
+        if key in suppress and not isinstance(suppress[key], list):
+            problems.append("suppress.%s must be a list" % key)
+    if suppress.get("after") is not None and parse_duration(suppress["after"]) is None:
+        problems.append("suppress.after must be a duration like 90d, got %r"
+                        % suppress["after"])
     return problems

@@ -252,10 +252,12 @@ def looks_signed_in(body: str) -> bool:
     and a partial run nobody was told about.
     """
     head = body[:200000]
-    if 'aria-label="Google Account' in head or '"gaia_' in head:
-        return True
-    # A prominent Sign in affordance means we are not.
-    return not (">Sign in<" in head or 'aria-label="Sign in"' in head)
+    # Only a POSITIVE marker counts. This used to answer "signed in" for any
+    # page without a Sign-in button -- so a consent page, an error page, or a
+    # redesign that renamed the button all read as signed in, and review data
+    # went missing under a profile that claimed the full view. Wrongly saying
+    # "signed out" costs a re-check; wrongly saying "signed in" costs data.
+    return 'aria-label="Google Account' in head or '"gaia_' in head
 
 
 def setup(hl: str = "en", gl: str = "us", timeout: float = 25.0,

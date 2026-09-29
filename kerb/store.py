@@ -87,11 +87,24 @@ def default_dir() -> Path:
                                Path.home() / ".kerb" / "state")).expanduser()
 
 
+def default_db() -> Path:
+    """The ledger every command shares unless told otherwise.
+
+    KERB_STATE_DB used to be read by the server alone, so a server pointed at
+    one ledger and `kerb reviews` / `kerb jobs` reading another could not see
+    each other's runs.
+    """
+    override = os.environ.get("KERB_STATE_DB")
+    if override:
+        return Path(override).expanduser()
+    return default_dir() / "kerb.db"
+
+
 class Store:
     """One SQLite file. Safe to share across threads; safe to kill at any point."""
 
     def __init__(self, path: Optional[Path] = None):
-        self.path = Path(path) if path else (default_dir() / "kerb.db")
+        self.path = Path(path) if path else default_db()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.db = sqlite3.connect(str(self.path), check_same_thread=False,
@@ -130,6 +143,13 @@ class Store:
             self.db.execute(
                 "UPDATE runs SET state=?, finished=?, stats=? WHERE id=?",
                 (state, time.time(), json.dumps(stats, default=str), run_id))
+
+    def set_state(self, run_id: str, state: str) -> None:
+        """Change a run's state alone. Resuming used finish_run, which stamped
+        a finish time on a run that had just started again."""
+        with self._lock:
+            self.db.execute("UPDATE runs SET state=?, finished=NULL WHERE id=?",
+                            (state, run_id))
 
     def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
@@ -174,22 +194,38 @@ class Store:
         Expired leases are reclaimed first. That reclaim is what makes a
         `kill -9` survivable: a task the dead process was holding returns to
         the queue by itself rather than sitting in `running` for ever.
+
+        Select-then-update inside one IMMEDIATE transaction rather than
+        `UPDATE ... RETURNING`: RETURNING needs SQLite 3.35, and the Python 3.9
+        this package supports ships with older ones on common distributions,
+        where every claim was a syntax error. The IMMEDIATE lock is what keeps
+        two processes from claiming the same task.
         """
         now = time.time()
         with self._lock:
-            self.db.execute(
-                "UPDATE tasks SET state=?, lease_until=NULL"
-                " WHERE run_id=? AND state=? AND lease_until IS NOT NULL"
-                " AND lease_until < ?", (PENDING, run_id, RUNNING, now))
-            sql = ("UPDATE tasks SET state=?, lease_until=?, attempts=attempts+1,"
-                   " updated_at=? WHERE id = (SELECT id FROM tasks"
-                   " WHERE run_id=? AND state IN (?,?) AND next_attempt_at<=?"
-                   + (" AND kind=?" if kind else "") +
-                   " ORDER BY next_attempt_at, updated_at LIMIT 1) RETURNING *")
-            args = [RUNNING, now + lease, now, run_id, PENDING, DEFERRED, now]
-            if kind:
-                args.append(kind)
-            row = self.db.execute(sql, args).fetchone()
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(
+                    "UPDATE tasks SET state=?, lease_until=NULL"
+                    " WHERE run_id=? AND state=? AND lease_until IS NOT NULL"
+                    " AND lease_until < ?", (PENDING, run_id, RUNNING, now))
+                sql = ("SELECT id FROM tasks WHERE run_id=? AND state IN (?,?)"
+                       " AND next_attempt_at<=?" + (" AND kind=?" if kind else "") +
+                       " ORDER BY next_attempt_at, updated_at LIMIT 1")
+                args = [run_id, PENDING, DEFERRED, now] + ([kind] if kind else [])
+                pick = self.db.execute(sql, args).fetchone()
+                row = None
+                if pick is not None:
+                    self.db.execute(
+                        "UPDATE tasks SET state=?, lease_until=?, attempts=attempts+1,"
+                        " updated_at=? WHERE id=?",
+                        (RUNNING, now + lease, now, pick["id"]))
+                    row = self.db.execute("SELECT * FROM tasks WHERE id=?",
+                                          (pick["id"],)).fetchone()
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
             return dict(row) if row else None
 
     def complete(self, task_id: str, results: Optional[List[Dict[str, Any]]] = None,

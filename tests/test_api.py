@@ -276,7 +276,9 @@ def test_source_failure_does_not_lose_the_run(sv):
     c["where"] = {"mode": "paste", "places": ["Nowhere-That-Exists-XYZQ"]}
     rid, summary = sv.run_campaign(c, wait=60)
 
-    assert summary["status"] == "done", summary
+    # Not `done`: a place could not be read, so the run did not see everything
+    # there was. `done` has to mean finished AND successful.
+    assert summary["status"] == "partial", summary
     stats = summary["stats"]
     trouble = stats.get("source_errors") or stats.get("skipped_places")
     assert trouble, "a source that could not deliver must be reported"
@@ -559,6 +561,95 @@ def test_stopping_keeps_what_was_collected(sv):
           % (summary["status"], kept))
 
 
+def test_the_app_confines_reads_however_it_is_started():
+    """Confinement lived in `kerb serve` only, so `uvicorn kerb.api:app` -- or
+    uvicorn's --reload child -- served every file on the machine. Checked in a
+    fresh interpreter: importing the app here would confine the test process."""
+    code = ("from kerb import api, paths\n"
+            "try:\n"
+            "    paths.check('/etc/passwd')\n"
+            "    print('OPEN')\n"
+            "except paths.PathNotAllowed:\n"
+            "    print('CONFINED')\n")
+    env = {k: v for k, v in os.environ.items() if k != "KERB_ALLOWED_PATHS"}
+    env["PYTHONPATH"] = str(ROOT)
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.stdout.strip() == "CONFINED", (out.stdout, out.stderr[-400:])
+    print("  app confines itself       ok")
+
+
+def test_a_foreign_host_header_is_refused(sv):
+    """Bound to loopback, the API answers loopback names only, so a page that
+    rebinds its own DNS name to 127.0.0.1 cannot drive it from a browser."""
+    for host, want in (("evil.example", 400), ("evil.example:%d" % sv.port, 400),
+                       ("localhost:%d" % sv.port, 200),
+                       ("127.0.0.1:%d" % sv.port, 200)):
+        req = urllib.request.Request(sv.base + "/api/health", headers={"Host": host})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                got = r.status
+        except urllib.error.HTTPError as e:
+            got = e.code
+        assert got == want, "Host %s -> %s (wanted %s)" % (host, got, want)
+    print("  foreign Host refused      ok")
+
+
+def test_rescore_moves_the_band_with_the_score(sv):
+    """Only the number was rewritten: a row rescored from 100 to 0 still said
+    "call today"."""
+    rid, _ = sv.run_campaign({**campaign_for(FIXTURE), "scoring": {
+        "weights": {"trade_match": 100},
+        "bands": [{"min": 80, "label": "call today"}, {"min": 0, "label": "later"}]}})
+    before = sv.get("/api/runs/%s/businesses?qualified=true" % rid)[1]["rows"]
+    assert before and all(r["band"] == "call today" for r in before), before[:1]
+    st, _ = sv.post("/api/runs/%s/rescore" % rid,
+                    {"weights": {"reviews": {"weight": 100, "scale": "linear",
+                                             "cap": 100000}}})
+    assert st == 200
+    after = sv.get("/api/runs/%s/businesses?qualified=true" % rid)[1]["rows"]
+    assert all(r["band"] == "later" for r in after), [(r["score"], r["band"]) for r in after]
+    print("  band follows rescore      ok")
+
+
+def test_exports_carry_attribution_and_safe_cells(sv):
+    """HTTP exports dropped the attribution OpenStreetMap's licence requires,
+    and wrote scraped names that start with `=` as live spreadsheet formulas."""
+    p = TMP / "attr.csv"
+    p.write_text("cid,title,category,phone,review_count,attribution\n"
+                 '0x9:0x1,"=HYPERLINK(""http://x"",""hi"")",Dentist,+44 20 7946 0000,'
+                 "50,© OpenStreetMap contributors\n")
+    rid, _ = sv.run_campaign(campaign_for(p))
+    st, body = sv.get("/api/runs/%s/export?format=json" % rid)
+    assert st == 200 and body["attribution"] == ["© OpenStreetMap contributors"], body
+    with urllib.request.urlopen(sv.base + "/api/runs/%s/export?format=csv" % rid,
+                                timeout=10) as r:
+        assert "OpenStreetMap" in (r.headers.get("X-Data-Attribution") or "")
+        text = r.read().decode()
+    import csv as _csv, io as _io
+    row = list(_csv.DictReader(_io.StringIO(text)))[0]
+    assert row["attribution"] == "© OpenStreetMap contributors", row
+    assert row["name"].startswith("'="), "a formula went out live: %r" % row["name"]
+    assert row["phone"] == "+44 20 7946 0000", "a phone number was mangled"
+    print("  exports attributed, safe  ok")
+
+
+def test_export_is_best_first_without_an_output_block(sv):
+    """With no `output:` block the export came out in ledger (cid) order."""
+    rid, _ = sv.run_campaign({**campaign_for(FIXTURE), "scoring": {"weights": {
+        "reviews": {"weight": 100, "scale": "log", "cap": 300}}}})
+    with urllib.request.urlopen(sv.base + "/api/runs/%s/export?format=csv" % rid,
+                                timeout=10) as r:
+        text = r.read().decode()
+    import csv as _csv, io as _io
+    scores = [float(row["score"]) for row in _csv.DictReader(_io.StringIO(text))]
+    assert len(scores) > 2 and scores == sorted(scores, reverse=True), scores
+    st, js = sv.get("/api/runs/%s/export?format=json" % rid)
+    got = [r["score"] for r in js["results"]]
+    assert got == sorted(got, reverse=True), got
+    print("  export best first         ok")
+
+
 def test_ui_is_self_contained(sv):
     """A strict-CSP-free local page still must not depend on the network."""
     import urllib.request as u
@@ -609,5 +700,10 @@ if __name__ == "__main__":
         test_durable_runs_store_verdicts_not_just_businesses(sv)
         test_one_unreadable_run_does_not_empty_the_list(sv)
         test_stopping_keeps_what_was_collected(sv)
+        test_a_foreign_host_header_is_refused(sv)
+        test_rescore_moves_the_band_with_the_score(sv)
+        test_exports_carry_attribution_and_safe_cells(sv)
+        test_export_is_best_first_without_an_output_block(sv)
         test_ui_is_self_contained(sv)
+    test_the_app_confines_reads_however_it_is_started()
     print("\nall api checks passed")

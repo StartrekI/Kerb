@@ -224,6 +224,77 @@ def test_a_broken_signal_never_kills_a_run():
     print("  error containment       ok")
 
 
+def test_a_painting_class_is_not_a_painter():
+    """The cafe fix defers any shared veto that overlaps the trade's own terms.
+    "painting" overlaps "painting class", so the veto meant FOR this pack was
+    dropped and an art class scored as a painting contractor at 0.95."""
+    painting = {"trade_match": {"pack": "trades/painting"}}
+    got = sig("trade_match", biz(name="Kids Art Hub", category="Painting class"),
+              **painting)
+    assert got.value is False and got.evidence["reason"] == "vetoed category", got.evidence
+    assert val("trade_match", biz(name="Ace Decorators", category="Painter"),
+               **painting) == "painting"
+    print("  painting class vetoed    ok")
+
+
+def test_parking_hosts_match_on_a_boundary():
+    """`dan.com` in host made jordan.com, sheridan.com and aidan.com "parked":
+    a live business reported as having lost its website."""
+    from kerb.signals.site import _parked
+    for live in ("https://jordan.com/", "https://sheridan.com/", "https://aidan.com/",
+                 "https://mybodis.com/", "https://godaddy.com/"):
+        assert _parked(live, "<html>fine</html>") is None, live
+    for parked in ("https://dan.com/buy-domain/x", "https://www.sedoparking.com/x",
+                   "https://ww12.bodis.com/", "https://www.godaddy.com/forsale/x.com"):
+        assert _parked(parked, ""), parked
+    assert _parked("https://example.com/", "This domain may be for sale!")
+    print("  parking hosts bounded    ok")
+
+
+def test_review_counts_are_read_not_guessed():
+    """Stripping every dot read a rating, "(4.8)", as 48 reviews; "1.2K" was
+    never read at all."""
+    from kerb.signals.detail import _count
+    assert _count("Rated 4.8 (4.8) stars") is None
+    assert _count("4.5 (1,234)") == 1234
+    assert _count("1.2K reviews") == 1200
+    assert _count("4.6 (2.345)") == 2345
+    assert _count("12 reviews") == 12
+    print("  review counts parsed     ok")
+
+
+def test_places_api_closure_statuses():
+    """CLOSED_PERMANENTLY, as the Places API writes it, read as OPEN."""
+    assert val("liveness", biz(status_raw="CLOSED_PERMANENTLY")) == "perm_closed"
+    assert val("liveness", biz(status_raw="CLOSED_TEMPORARILY")) == "temp_closed"
+    assert val("liveness", biz(status_raw="OPERATIONAL")) == "open"
+    print("  places api statuses      ok")
+
+
+def test_zero_is_a_threshold_not_unset():
+    """`or 24` turned a deliberate 0 into the default."""
+    assert val("liveness", biz(first_review_year=2025, review_count=0),
+               liveness={"stale_after_months": 0}) == "stale"
+    assert val("rating_band", biz(rating=4.9, review_count=1),
+               rating_band={"min_reviews": 0}) == "excellent"
+    print("  zero thresholds honoured ok")
+
+
+def test_lower_is_better_ranks_the_right_way():
+    """The UI ranked chain_size with higher-is-better, so a 3-branch chain
+    outscored an independent. The registry now says how each number ranks."""
+    from kerb import scoring
+    spec = dict(signals.get("chain_size").rank, weight=40)
+    assert spec["invert"] is True
+    assert scoring._points(1, spec) > scoring._points(3, spec) > scoring._points(10, spec)
+    assert scoring._points(None, spec) == 0.0, "unknown must not earn points"
+    assert signals.get("establishment_age").rank is False, "a year is not a magnitude"
+    assert signals.get("reviews").rank["cap"] == 300
+    assert scoring.check_weight("x", {"weight": 1, "cap": 5, "invert": "yes"})
+    assert scoring.check_weight("x", {"weight": 1, "cap": 5, "capp": 6})
+    print("  rank hints and invert    ok")
+
+
 if __name__ == "__main__":
     print("signals — regression against real production failures\n")
     test_web_presence()
@@ -235,4 +306,10 @@ if __name__ == "__main__":
     test_unknown_review_count_is_not_zero()
     test_contact_links_are_not_a_website()
     test_a_broken_signal_never_kills_a_run()
+    test_a_painting_class_is_not_a_painter()
+    test_parking_hosts_match_on_a_boundary()
+    test_review_counts_are_read_not_guessed()
+    test_places_api_closure_statuses()
+    test_zero_is_a_threshold_not_unset()
+    test_lower_is_better_ranks_the_right_way()
     print("\nall signal checks passed")
