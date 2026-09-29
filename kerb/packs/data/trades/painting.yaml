@@ -10,6 +10,11 @@ veto_categories:
   - building materials
   - house cleaning service
   - plumber                      # "Plumbing Work, Painting Work, Borewell"
+  - painting class               # teaches painting, does not do it. Listed
+                                 # here as well as in the shared list: a shared
+                                 # veto that overlaps a trade's own terms is
+                                 # deferred, and "painting" overlaps it -- so
+                                 # only the pack's own copy actually applies.
 notes: |
   A big brand's own painting-SERVICE arm (e.g. Asian Paints Beautiful Homes)
   IS in scope. The test is "performs painting work", not "is independent" --

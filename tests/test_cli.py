@@ -48,7 +48,8 @@ MANAGED = [
     # user's own windows with it.
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome "
     "--user-data-dir=/tmp/kerb-worker-1234 --headless",
-    "/usr/bin/chromedriver --kerb --port=9515",
+    # chromedriver carries no tag of its own; it is found through the browser
+    # registry -- see test_registered_browsers_and_their_children_are_found.
 ]
 
 UNTOUCHABLE = [
@@ -104,10 +105,81 @@ def test_kerberos_is_not_kerb():
     print("  word boundaries hold      ok")
 
 
+def test_the_review_browser_is_launched_with_the_tag():
+    """The patterns above were tested against command lines Kerb never
+    produced: the review browser launched with Chrome's anonymous temp profile,
+    so `kerb stop` could not see the one process this project must never leak."""
+    import shutil
+    from kerb.session import Profile
+    from kerb.signals.detail import _profile_dir, chrome_args
+    saved = os.environ.pop("KERB_CHROME_PROFILE", None)
+    try:
+        udd, owned = _profile_dir()
+        try:
+            assert owned and "kerb-worker" in os.path.basename(udd), udd
+            cmd = "/opt/google/chrome/chrome " + " ".join(chrome_args(Profile({}), udd))
+            assert matches(cmd), "kerb stop cannot see the browser it launches"
+        finally:
+            shutil.rmtree(udd, ignore_errors=True)
+    finally:
+        if saved is not None:
+            os.environ["KERB_CHROME_PROFILE"] = saved
+    print("  review browser tagged     ok")
+
+
+def test_registered_browsers_and_their_children_are_found():
+    """chromedriver has no tag, and a user-chosen profile has none either, so
+    launches are recorded by pid -- with the whole tree beneath them, since a
+    renderer's command line does not reliably say "chrome". A recorded pid
+    that no longer looks like a browser (pids are reused) is never touched."""
+    import subprocess
+    import tempfile
+    import time
+    from kerb import cli, procs
+    saved = os.environ.get("KERB_STATE_DIR")
+    os.environ["KERB_STATE_DIR"] = tempfile.mkdtemp(prefix="kerb-procs-")
+    parent = stranger = None
+    try:
+        child_code = "import time; time.sleep(60)"
+        parent = subprocess.Popen(
+            [sys.executable, "-c",
+             "import subprocess, sys, time; "
+             "subprocess.Popen([sys.executable, '-c', %r, 'renderer']); "
+             "time.sleep(60)" % child_code, "chromedriver-standin"])
+        stranger = subprocess.Popen([sys.executable, "-c", child_code, "not-a-browser"])
+        time.sleep(0.8)                     # let the child start
+        procs.register([parent.pid, stranger.pid], None)
+
+        found = {p["pid"] for p in cli.find_managed()}
+        rows = cli._ps()
+        child = [r["pid"] for r in rows if r["ppid"] == parent.pid]
+        assert parent.pid in found, "a registered browser was not found"
+        assert child and set(child) <= found, "its child was left behind"
+        assert stranger.pid not in found, "a reused pid would have been killed"
+
+        for pid in [parent.pid] + child:
+            os.kill(pid, 9)
+        parent.wait(timeout=5)
+        time.sleep(0.3)
+        cli._forget_dead_browsers()
+        assert parent.pid not in procs.registered_pids(), "a dead entry was kept"
+    finally:
+        for p in (parent, stranger):
+            if p is not None and p.poll() is None:
+                p.kill()
+        if saved is None:
+            os.environ.pop("KERB_STATE_DIR", None)
+        else:
+            os.environ["KERB_STATE_DIR"] = saved
+    print("  registered browsers found ok")
+
+
 if __name__ == "__main__":
     print("cli — process discovery safety\n")
     for fn in (test_finds_everything_it_started, test_never_touches_anything_else,
                test_case_insensitivity_is_the_point, test_never_returns_its_own_ancestors,
-               test_kerberos_is_not_kerb):
+               test_kerberos_is_not_kerb,
+               test_the_review_browser_is_launched_with_the_tag,
+               test_registered_browsers_and_their_children_are_found):
         fn()
     print("\nall cli checks passed")

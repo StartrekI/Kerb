@@ -475,15 +475,15 @@ tr.rejected .score,tr.unevaluated .score{color:var(--k-mut);font-size:17px}
     <div class="hero-main">
       <h1>Every verdict carries its evidence.</h1>
       <p class="lead">Kerb takes a list of local businesses — from a spreadsheet you
-         already have, or from OpenStreetMap — and tells you which ones are worth
-         contacting, and <em>why</em>. Every score shows the measurement behind it.
+         already have, from Google Maps, or from OpenStreetMap — and tells you which
+         ones are worth contacting, and <em>why</em>. Every score shows the measurement behind it.
          When Kerb cannot measure something, it says so rather than guessing.</p>
       <div class="hero-actions">
         <button class="k-b pri" id="newBriefBtn">Start a brief</button>
         <button class="k-b" id="lastFindingsBtn" disabled>Open last findings</button>
       </div>
-      <p class="hint hero-note">Free and open source. It runs on your own machine and
-         sends nothing anywhere.</p>
+      <p class="hint hero-note">Free and open source. It runs on your own machine, and
+         your briefs and results never leave it.</p>
     </div>
     <div class="hero-facts" id="heroFacts"></div>
   </section>
@@ -808,8 +808,8 @@ tr.rejected .score,tr.unevaluated .score{color:var(--k-mut);font-size:17px}
 "use strict";
 const $  = s => document.querySelector(s);
 const $$ = s => Array.from(document.querySelectorAll(s));
-const esc = s => String(s ?? "").replace(/[&<>"]/g, c => (
-  {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => (
+  {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 const api = {
   async get(p){ const r = await fetch(p); if(!r.ok) throw await err(r); return r.json(); },
@@ -878,9 +878,10 @@ $("#rerunBtn").addEventListener("click", () => startRun());
   $("#heroFacts").innerHTML = [
     [signals.length, "Signals", "Things Kerb can measure about a business."],
     [trades0.length, "Trades", "Ready-made definitions of what counts as the trade."],
-    [sources.length, "Sources", "A file you already have, or OpenStreetMap."],
+    [sources.length, "Sources",
+     sources.map(x => x.label).join(", ") + "."],
     [sources.filter(x => x.needs_key).length, "Keys needed",
-     "Sources here that want an API key. No sign-up, no account, no data sent out."]
+     "Sources here that want an API key. No sign-up, no account, no telemetry."]
   ].map(([n,l,d]) =>
     `<div><b>${n}</b><span class="k-lbl">${l}</span><p>${d}</p></div>`).join("");
 
@@ -996,12 +997,14 @@ function onSourceChange(){
      secret should live. */
   const needsSetup = !!(s.needs_key && !s.key_present);
   $("#setupNote").hidden = !needsSetup;
+  /* The variable is the SOURCE's to name. One was hard-coded here, for a
+     keyed source that does not exist. */
   if (needsSetup)
     $("#setupNote").innerHTML = `<div class="notice warn"><i></i><div>
       <b>${esc(s.label)} needs an API key</b>
       <p>Kerb reads it from the environment, never from this page — a brief is a
          document you copy and share.</p>
-      <p class="mono" style="margin-top:8px;color:var(--k-tx)">export GOOGLE_PLACES_API_KEY=…
+      <p class="mono" style="margin-top:8px;color:var(--k-tx)">export ${esc(s.key_env || "THE_KEY")}=…
          <br>python3 -m kerb serve</p>
       <p>Set it, restart Kerb, and this notice disappears.</p></div></div>`;
 }
@@ -1158,19 +1161,29 @@ const coreWeights = () => S.caps.signals
 function weightSpecs(){
   const enabled = FILTERS.filter(f => $(`[data-on="${f.id}"]`)?.checked).map(f => f.id);
   const on = new Set(enabled);
+  /* A number ranks the way its SIGNAL says (`rank`: scale, cap, and whether
+     lower is better). This used to be guessed -- a cap of ten times the
+     suggested filter value, higher always better -- which ranked a 3-branch
+     chain above an independent, and gave full marks to anything with a
+     first-review YEAR. `rank: false` means filter on it, never rank by it. */
   const wanted = [...new Set([...coreWeights(), ...enabled])]
     .map(name => S.caps.signals.find(s => s.name === name))
-    .filter(s => s && s.kind !== "text");
-  return wanted.map(s => ({
-    name: s.name, label: s.label, kind: s.kind,
-    good: (s.suggest && Array.isArray(s.suggest.value)) ? s.suggest.value
-          : (s.values || []).slice(0, 1),
-    values: s.values || [],
-    cap: s.kind === "number" ? Math.max(10, ((s.suggest||{}).value || 30) * 10) : null,
-    /* Derived from intent, not from signal names: something you chose to filter
-       on weighs more than something merely carried along. */
-    weight: on.has(s.name) ? 40 : 25,
-  }));
+    .filter(s => s && s.kind !== "text" && !(s.kind === "number" && s.rank === false));
+  return wanted.map(s => {
+    const rank = s.kind === "number" ? (s.rank || {scale: "log", cap: 100}) : null;
+    return {
+      name: s.name, label: s.label, kind: s.kind,
+      good: (s.suggest && Array.isArray(s.suggest.value)) ? s.suggest.value
+            : (s.values || []).slice(0, 1),
+      values: s.values || [],
+      scale: rank ? (rank.scale || "log") : null,
+      cap: rank ? rank.cap : null,
+      invert: !!(rank && rank.invert),
+      /* Derived from intent, not from signal names: something you chose to
+         filter on weighs more than something merely carried along. */
+      weight: on.has(s.name) ? 40 : 25,
+    };
+  });
 }
 
 function renderWeights(){
@@ -1183,7 +1196,9 @@ function renderWeights(){
         <span class="k-lbl">${Math.round(w.weight/total*100)}%</span></div>
       <input class="k-sl" type="range" data-w="${esc(w.name)}" min="0" max="60" value="${w.weight}">
       <p class="hint" style="margin-top:4px;font-size:11.5px">${
-        w.kind === "number" ? `Log scale to ${w.cap}.`
+        w.kind === "number"
+          ? (w.invert ? `Fewer is better — full points at 0, none from ${w.cap}.`
+                      : `${w.scale === "log" ? "Log" : "Linear"} scale, full points at ${w.cap}.`)
         : w.kind === "boolean" ? "Full points when true."
         : `Points for ${esc(w.good.join(", ")) || "the preferred value"}.`}</p>
     </div>`).join("");
@@ -1215,7 +1230,9 @@ function buildWeights(){
     const el = $(`[data-w="${w.name}"]`);
     const value = el ? Number(el.value) : w.weight;
     if (!value) continue;
-    if (w.kind === "number")        out[w.name] = {weight: value, scale: "log", cap: w.cap};
+    if (w.kind === "number")
+      out[w.name] = Object.assign({weight: value, scale: w.scale, cap: w.cap},
+                                  w.invert ? {invert: true} : {});
     else if (w.kind === "boolean")  out[w.name] = value;
     else {
       const map = {};
@@ -1415,7 +1432,7 @@ async function validate(){
           return alt ? `<p>This source <b>does</b> collect
             <b>${esc(altLabel)}</b> — use that instead.
             <button type="button" class="k-b sm" style="margin-left:8px"
-              onclick="kerb.swapCondition('${esc(n)}','${esc(alt)}')">Switch to
+              data-swap-off="${esc(n)}" data-swap-on="${esc(alt)}">Switch to
               ${esc(altLabel)}</button></p>` : "";
         }).join("")}</div></div>`;
       $("#runBtn").disabled = true; $("#rerunBtn").disabled = true;
@@ -1457,6 +1474,13 @@ async function validate(){
     }catch(e){ /* server down; the run button will surface it */ }
   }, 220);
 }
+
+/* Data attributes and one listener, not an inline onclick with the signal
+   names pasted into JavaScript. */
+$("#problems").addEventListener("click", e => {
+  const b = e.target.closest("[data-swap-off]"); if (!b) return;
+  kerb.swapCondition(b.dataset.swapOff, b.dataset.swapOn);
+});
 
 /* One delegated listener: the controls are re-rendered from the API, so
    per-element handlers would be lost on every re-render. */
@@ -1548,16 +1572,36 @@ $("#yamlBtn").addEventListener("click", async () => {
   ta.value = yaml; ta.focus(); ta.select();
 });
 
+// @yaml-begin -- extracted and run by tests/test_ui.py, keep self-contained
+/* The brief as YAML, for `kerb run`. The old version quoted only strings with
+   a colon, a hash or a newline, so the DEFAULT brief came out as `op: >=`
+   (a block-scalar indicator) and `op: !=` (a tag) and `kerb run` refused the
+   file it was given. A scalar is now written plain only when YAML cannot read
+   it as anything else; every other string is JSON-quoted, which is valid YAML.
+   Keys go through the same rule -- a weight on the value `on` or `no` is a
+   boolean key to YAML unless it is quoted. */
+const YAML_WORDS = /^(true|false|yes|no|on|off|y|n|null|~)$/i;
+function yamlScalar(v){
+  if (v === null || v === undefined) return "null";
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : "null";
+  if (typeof v === "boolean") return String(v);
+  const s = String(v);
+  return /^[A-Za-z_][A-Za-z0-9_./-]*( [A-Za-z0-9_./-]+)*$/.test(s) && !YAML_WORDS.test(s)
+    ? s : JSON.stringify(s);
+}
 function toYaml(o, ind=0){
   const p = "  ".repeat(ind);
-  if (Array.isArray(o)) return o.map(v => typeof v === "object" && v !== null
-      ? `${p}-\n${toYaml(v, ind+1)}` : `${p}- ${fmt(v)}`).join("\n");
-  if (o && typeof o === "object") return Object.entries(o).map(([k,v]) =>
-      (v && typeof v === "object")
-        ? `${p}${k}:\n${toYaml(v, ind+1)}` : `${p}${k}: ${fmt(v)}`).join("\n");
-  return `${p}${fmt(o)}`;
+  const nested = v => v !== null && typeof v === "object"
+                      && (Array.isArray(v) ? v.length : Object.keys(v).length);
+  const inline = v => Array.isArray(v) ? "[]"
+                    : (v !== null && typeof v === "object") ? "{}" : yamlScalar(v);
+  if (Array.isArray(o)) return o.map(v => nested(v)
+      ? `${p}-\n${toYaml(v, ind+1)}` : `${p}- ${inline(v)}`).join("\n");
+  if (o && typeof o === "object") return Object.entries(o).map(([k,v]) => nested(v)
+      ? `${p}${yamlScalar(k)}:\n${toYaml(v, ind+1)}` : `${p}${yamlScalar(k)}: ${inline(v)}`).join("\n");
+  return `${p}${inline(o)}`;
 }
-const fmt = v => typeof v === "string" && /[:#\n]/.test(v) ? JSON.stringify(v) : String(v);
+// @yaml-end
 
 /* -- running ------------------------------------------------------------- */
 /* The pipeline's shape comes from the registry's cost tiers, so a new tier
@@ -1681,7 +1725,12 @@ function onEvent(e){
   } else if (e.stage === "source_error"){
     logLine(t, "source-error", `${e.source}: ${e.error}`, "var(--k-crit)");
   } else if (e.stage === "source_partial"){
-    logLine(t, "partial", `${e.source}: ${e.error||"incomplete"}`, "var(--k-warn)");
+    logLine(t, "partial", `${e.source}: ${e.skipped} place(s) could not be read`,
+            "var(--k-warn)");
+  } else if (e.stage === "source_note"){
+    logLine(t, "note", `${e.source}: ${e.note}`, "var(--k-warn)");
+  } else if (e.stage === "halt"){
+    logLine(t, "halted", e.reason || "the source stopped the run", "var(--k-crit)");
   } else if (["discover_suspect","discover_degraded"].includes(e.stage)){
     logLine(t, "degraded", `${e.source||""} yield below baseline`, "var(--k-warn)");
   } else if (e.stage === "breaker"){
@@ -1834,10 +1883,31 @@ function renderWarnings(summary, page){
       errs.map(([k,v]) => `${k}: ${v}`)));
 
   if (skipped.length)
-    bits.push(card("info",
+    bits.push(card("warn",
       skipped.length === 1 ? "1 place was skipped" : `${skipped.length} places were skipped`,
-      `Nothing was searched in these areas.`,
+      `These areas could not be read, so this run is partial. Re-run later to
+       cover them.`,
       skipped.slice(0,6).map(([k,v]) => `${k} — ${v}`)));
+
+  /* A cap, a budget or a halted source ends a run early whether or not any
+     business was left unmeasured; the unevaluated card only covered the
+     second case, so a run cut short by its request budget said nothing. */
+  if (st.stopped_reason && !st.unevaluated)
+    bits.push(card("warn", "The run stopped early", esc(st.stopped_reason),
+      []));
+
+  const notes = st.notes || [];
+  if (notes.length)
+    bits.push(card("info", "Before you act on these results",
+      `The source asked for this to be said up front.`, notes));
+
+  const empty = Object.entries(st.empty_places || {});
+  if (empty.length)
+    bits.push(card("info",
+      empty.length === 1 ? "1 place held nothing" : `${empty.length} places held nothing`,
+      `Searched fine, with no listings for this trade — an answer, not a
+       failure. A long list of these can also mean the source is throttling.`,
+      empty.slice(0,6).map(([k,v]) => `${k} — ${v}`)));
 
   if (page && page.total > page.rows.length)
     bits.push(card("info", "Showing the first " + page.rows.length.toLocaleString(),
@@ -2208,9 +2278,19 @@ $("#csvBtn").addEventListener("click", () => {
   const rows = visible();
   const cols = ["score","name","category","address","phone","website","booking_url",
                 "rating","review_count","outcome","band","reject_reason","cid"];
+  /* Licence notices travel with the data: OpenStreetMap's requires it. */
+  const withAttr = rows.some(r => (r.extras || {}).attribution);
+  if (withAttr) cols.push("attribution");
+  const value = (r, c) => c === "attribution" ? (r.extras || {}).attribution : r[c];
+  /* Names are scraped, so strangers wrote them: a cell starting = + - @ runs
+     as a spreadsheet formula. Same rule as the server's csv_safe -- phone and
+     signed numbers pass, anything else gets a leading apostrophe. */
+  const safe = v => typeof v === "string" && v &&
+      ("=@\t\r".includes(v[0]) || ("+-".includes(v[0]) && !/^[+-][\d\s().\-\/]*$/.test(v)))
+    ? "'" + v : v;
   const csv = [cols.join(",")].concat(rows.map(r => cols.map(c => {
-    const v = r[c] ?? "";
-    return /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g,'""')}"` : v;
+    const v = safe(value(r, c) ?? "");
+    return /[",\n\r]/.test(String(v)) ? `"${String(v).replace(/"/g,'""')}"` : v;
   }).join(","))).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([csv], {type:"text/csv"}));

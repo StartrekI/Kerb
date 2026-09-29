@@ -329,6 +329,71 @@ def test_the_cheap_tier_only_sees_what_survived_free():
     print("  cheap tier gated by free  ok  (20 businesses, %d requests)" % len(fetched))
 
 
+def test_website_fetches_count_against_the_budget():
+    """`note_request` existed and nothing called it, so a budget of 3 let the
+    cheap tier make 20 website fetches while reporting 0 requests."""
+    pages = {"https://b%d.example/" % i: (200, LONG, {}) for i in range(20)}
+    net = FakeNet(pages=pages)
+    fixture = TMP / "budget.csv"
+    fixture.write_text("cid,title,category,review_count,website\n" + "".join(
+        "0xu:0x%02x,Dental %d,Dentist,90,https://b%d.example/\n" % (i, i, i)
+        for i in range(20)))
+    with net.install():
+        f = Fetcher(cache_dir=None, per_host=10000, respect_robots=False)
+        campaign = Campaign.from_dict({
+            "sources": [{"id": "csv", "options": {"path": str(fixture)}}],
+            "what": {"packs": ["trades/dentist"]},
+            "filters": [{"signal": "site_status", "op": "==", "value": "live"}],
+            "limits": {"max_requests": 3},
+            "signal_options": {"site_status": {"fetcher": f}}})
+        pipe = Pipeline(campaign)
+        list(pipe.run())
+    fetched = [h for h in net.hits if ".example/" in h]
+    assert len(fetched) <= 3, "a budget of 3 made %d website fetches" % len(fetched)
+    assert pipe.stats.requests == len(fetched), (pipe.stats.requests, len(fetched))
+    assert "budget" in (pipe.stats.stopped_reason or "")
+    print("  site fetches are budgeted  ok  (%d fetches)" % len(fetched))
+
+
+def test_three_cheap_signals_share_one_fetch_even_when_the_site_is_dead():
+    """The disk cache keeps successes only, so a dead site was fetched once
+    per cheap signal: three requests -- and three timeouts -- for one fact."""
+    net = FakeNet(pages={"https://dead.example/": (404, "gone", {}),
+                         "https://slow.example/": (0, httpx.ConnectTimeout("t"), {})})
+    with net.install():
+        f = Fetcher(cache_dir=None, per_host=10000, respect_robots=False)
+        ctx_opts = {n: {"fetcher": f} for n in ("site_status", "site_platform",
+                                                "site_contact")}
+        for url in ("https://dead.example/", "https://slow.example/"):
+            ctx = Context(options=ctx_opts)
+            for n in ("site_status", "site_platform", "site_contact"):
+                signals.compute(n, biz(website=url), ctx)
+            assert ctx.requests == 1, "%s cost %d requests" % (url, ctx.requests)
+    assert net.hits.count("https://dead.example/") == 1, net.hits
+    assert net.hits.count("https://slow.example/") == 1, net.hits
+    print("  cheap signals share fetch  ok")
+
+
+def test_robots_redirects_are_followed():
+    """Most robots.txt files are reached through http->https or a www hop.
+    Unfollowed, the parser read the redirect's empty body and allowed all."""
+    def handler(request):
+        url = str(request.url)
+        if url == "http://r.example/robots.txt":
+            return httpx.Response(301, headers={"location": "https://r.example/robots.txt"})
+        if url == "https://r.example/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nDisallow: /private")
+        return httpx.Response(200, text=LONG)
+
+    f = Fetcher(cache_dir=None, per_host=10000)
+    f._client = httpx.Client(transport=httpx.MockTransport(handler))
+    blocked = f.get("http://r.example/private/page")
+    assert blocked.error and "robots" in blocked.error, blocked
+    assert blocked.requests == 2, "robots + its redirect hop: %s" % blocked.requests
+    assert f.get("http://r.example/public").ok
+    print("  robots redirects followed  ok")
+
+
 if __name__ == "__main__":
     print("fetch — the only part that talks to strangers\n")
     for fn in (test_url_normalisation,
@@ -343,6 +408,9 @@ if __name__ == "__main__":
                test_a_fetch_failure_is_a_failed_measurement_not_a_dead_site,
                test_platform_is_read_from_html_not_the_url,
                test_contact_extraction_skips_toolchain_noise,
-               test_the_cheap_tier_only_sees_what_survived_free):
+               test_the_cheap_tier_only_sees_what_survived_free,
+               test_website_fetches_count_against_the_budget,
+               test_three_cheap_signals_share_one_fetch_even_when_the_site_is_dead,
+               test_robots_redirects_are_followed):
         fn()
     print("\nall fetch checks passed")

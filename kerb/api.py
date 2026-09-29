@@ -31,16 +31,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import paths, scoring, signals, sources
-from .campaign import Campaign, validate
+from .campaign import Campaign, durable_problem, validate
 from .models import Outcome, Verdict
 from .store import Store, default_dir
 from .packs import library
-from .pipeline import Pipeline
+from .pipeline import Pipeline, stored_signals, terminal_status
 from .sources.csv_ingest import inspect as inspect_file
 
 STATIC = Path(__file__).parent / "static"
@@ -67,12 +67,10 @@ def store() -> Store:
     global _STORE
     with _STORE_LOCK:
         if _STORE is None:
-            _STORE = Store(Path(os.environ["KERB_STATE_DB"])
-                           if os.environ.get("KERB_STATE_DB") else None)
+            _STORE = Store()                 # honours KERB_STATE_DB itself
             # Anything still marked running belongs to a process that no longer
             # exists. Say so rather than leaving a record that lies.
-            for run_id in _STORE.reconcile():
-                pass
+            _STORE.reconcile()
             _STORE.prune(keep=MAX_RUNS)
         return _STORE
 
@@ -85,9 +83,12 @@ def store() -> Store:
 # on the network, and campaign source paths are attacker-controlled from there.
 # Unconstrained, `{"path": "/etc/passwd"}` turned the importer into a file
 # reader for anyone on the LAN.
+#
+# The confinement itself is switched on in create_app(), so the HTTP surface is
+# confined however it is started. It used to happen only in `kerb serve`, so
+# `uvicorn kerb.api:app` -- or uvicorn's --reload child -- served every file.
 
-def allowed_roots() -> List[Path]:
-    return paths.roots() or [Path.cwd().resolve()]
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 def safe_path(p: str) -> Path:
@@ -242,8 +243,28 @@ def stored_summary(run_id: str) -> Optional[Dict[str, Any]]:
 
 
 def run_data(run_id: str) -> List[Dict[str, Any]]:
-    live = RUNS.get(run_id)
     return list(store().results(run_id))
+
+
+def qualified_data(run_id: str) -> List[Dict[str, Any]]:
+    """A run's qualified rows, in ledger order, decoding only those.
+
+    Rescoring and the default export want nothing else, and decoding every row
+    to throw most of them away was most of their time on a large run.
+    """
+    db = store()
+    outline = db.outline(run_id)
+    if outline is None:
+        return [r for r in db.results(run_id)
+                if r.get("outcome") == Outcome.QUALIFIED.value]
+    return db.results_for(run_id, [r["cid"] for r in outline
+                                   if r["outcome"] == Outcome.QUALIFIED.value])
+
+
+# Rows per chunk of a streamed export. Starlette runs each step of a plain
+# generator in its threadpool, and one hop per row cost ~5s on 45,000 rows --
+# more than writing the CSV did.
+EXPORT_CHUNK = 500
 
 
 def _default_columns() -> List[str]:
@@ -314,11 +335,7 @@ def _verdict_from_row(row: Dict[str, Any]) -> Verdict:
     verdict.rejected_by = row.get("rejected_by")
     verdict.reject_reason = row.get("reject_reason")
     for name, data in (row.get("signals") or {}).items():
-        data = data or {}
-        verdict.add(Signal(name=name, value=data.get("value"),
-                           confidence=float(data.get("confidence") or 0.0),
-                           evidence=data.get("evidence") or {},
-                           version=int(data.get("version") or 1)))
+        verdict.add(Signal.from_dict(name, data))
     return verdict
 
 
@@ -355,7 +372,8 @@ def _collect_durably(run: Run, db: Store, suppression=None) -> None:
     campaign = run.campaign
     places = campaign.places
     source_id = next((s.get("id") if isinstance(s, dict) else s)
-                     for s in campaign.sources)
+                     for s in campaign.sources
+                     if not (isinstance(s, dict) and s.get("enabled") is False))
     opts = next((s.get("options") or {} for s in campaign.sources
                  if isinstance(s, dict)), {})
 
@@ -388,22 +406,39 @@ def _collect_durably(run: Run, db: Store, suppression=None) -> None:
     db.save_results(run.id, [v.to_dict() for v in verdicts])
     run.stats = {**pipe.stats.to_dict(), **res.to_dict()}
     left = db.pending_count(run.id)
-    failed = len(db.failures(run.id))
+    failed = len(res.failures)
     run.stats["places_left"] = left
     run.stats["places_failed"] = failed
+    if res.stopped and not run.stopping:
+        # A halt (Google blocked the address) or a tripped breaker. Said as the
+        # run's stop reason, so it reaches the summary rather than only the log.
+        run.stats["stopped_reason"] = run.stats.get("stopped_reason") or res.stopped
     # `done` has to mean "finished, and everything worked". A run where every
     # unit failed used to report `done`, which is the same shape of dishonesty
     # as a rejection reason that blames a business for a network error.
-    if run.stopping:
-        run.status = "stopped"
-    elif left or failed or run.stats.get("stopped_reason"):
+    run.status = terminal_status(run.stats, run.stopping)
+    if not run.stopping and (left or failed) and run.status == "done":
         run.status = "partial"
-    else:
-        run.status = "done"
     if left or failed:
         run.emit({"stage": "incomplete", "places_left": left,
                   "places_failed": failed,
                   "note": "resume to continue where this stopped"})
+
+
+def _release_browser() -> None:
+    """Close the review browser once no run is using it.
+
+    It is shared across runs, so it cannot close when one finishes while
+    another may be mid-way through the expensive tier. Left open for the life
+    of the server it was a Chrome nobody was using and nothing would stop.
+    """
+    from .signals import detail
+    if not detail.in_use():
+        return
+    with _RUNS_LOCK:
+        busy = any(r.status in ("queued", "running") for r in RUNS.values())
+    if not busy:
+        detail.close()
 
 
 def _execute(run: Run) -> None:
@@ -444,29 +479,24 @@ def _execute(run: Run) -> None:
             return
         pipe = Pipeline(run.campaign, on_progress=run.emit,
                         suppression=suppression)
-        for verdict in pipe.run():
-            batch.append(verdict.to_dict())
-            run.counts["total"] += 1
-            run.counts[verdict.outcome.value] = \
-                run.counts.get(verdict.outcome.value, 0) + 1
-            if len(batch) >= FLUSH_EVERY or (time.time() - last_flush) > FLUSH_SECONDS:
-                flush()
-            if run.stopping:
-                run.emit({"stage": "stop", "reason": "stopped by user"})
-                break
+        verdicts = pipe.run()
+        try:
+            for verdict in verdicts:
+                batch.append(verdict.to_dict())
+                run.counts["total"] += 1
+                run.counts[verdict.outcome.value] = \
+                    run.counts.get(verdict.outcome.value, 0) + 1
+                if len(batch) >= FLUSH_EVERY or (time.time() - last_flush) > FLUSH_SECONDS:
+                    flush()
+                if run.stopping:
+                    run.emit({"stage": "stop", "reason": "stopped by user"})
+                    break
+        finally:
+            # Closed now, not at garbage collection: closing is what tells a
+            # source's worker threads to stop fetching.
+            verdicts.close()
         run.stats = pipe.stats.to_dict()
-        # A source that died is not a complete run either, however many results
-        # the surviving sources produced.
-        if run.stopping:
-            run.status = "stopped"
-        elif run.stats.get("source_errors") or run.stats.get("stopped_reason"):
-            # A run cut short by one of its own caps did not finish the input.
-            # `done` has to mean finished AND successful, so a result cap, a
-            # runtime budget or a tripped breaker all land on `partial` --
-            # otherwise the caller believes they saw everything there was.
-            run.status = "partial"
-        else:
-            run.status = "done"
+        run.status = terminal_status(run.stats, run.stopping)
     except Exception as exc:                       # noqa: BLE001
         run.status = "failed"
         run.error = "%s: %s" % (type(exc).__name__, exc)
@@ -483,6 +513,7 @@ def _execute(run: Run) -> None:
         run.finished = time.time()
         run.emit({"stage": "finished", "status": run.status, **run.stats})
         retire(run.id)
+        _release_browser()
 
 
 # --------------------------------------------------------------------------
@@ -516,9 +547,53 @@ class RescoreBody(BaseModel):
 # App
 # --------------------------------------------------------------------------
 
+def allowed_hosts() -> Optional[List[str]]:
+    """Host headers this server answers, or None for any.
+
+    Bound to loopback, only loopback names -- so a web page that rebinds its
+    own DNS name to 127.0.0.1 cannot drive the API from the user's browser,
+    which would otherwise let any site read the results and start runs.
+    Bound to the network, the machine's names are not knowable here, so any
+    host is accepted unless KERB_ALLOWED_HOSTS lists them; `kerb serve` warns
+    that such a server has no authentication.
+    """
+    extra = [h.strip().lower() for h in
+             os.environ.get("KERB_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    bind = os.environ.get("KERB_BIND_HOST", "127.0.0.1").strip().lower()
+    if bind in LOOPBACK_HOSTS:
+        return list(LOOPBACK_HOSTS) + extra
+    return extra or None
+
+
+def _host_of(header: str) -> str:
+    """`example.com:8000` -> example.com, `[::1]:8000` -> ::1."""
+    header = (header or "").strip().lower()
+    if header.startswith("["):
+        return header[1:header.find("]")] if "]" in header else header
+    return header.rsplit(":", 1)[0] if header.count(":") == 1 else header
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Kerb", version="0.1.0",
                   description="Find and qualify local businesses. Anywhere, any trade.")
+
+    # The HTTP surface is confined however it is started. The CLI set this up
+    # before handing over to uvicorn; started any other way -- `uvicorn
+    # kerb.api:app`, or uvicorn's own --reload child -- it read every file.
+    if not paths.confined():
+        paths.confine(paths.from_env() or [Path.cwd()])
+
+    hosts = allowed_hosts()
+    if hosts is not None:
+        from fastapi.responses import PlainTextResponse
+
+        @app.middleware("http")
+        async def check_host(request, call_next):
+            if _host_of(request.headers.get("host", "")) not in hosts:
+                return PlainTextResponse(
+                    "this Kerb server only answers requests addressed to %s"
+                    % ", ".join(hosts), status_code=400)
+            return await call_next(request)
 
     # -- capability discovery: the UI renders itself from these -------------
 
@@ -529,10 +604,11 @@ def create_app() -> FastAPI:
         # fell ten signals behind the registry without anything noticing.
         return [r.to_dict() for r in signals.all_signals()]
 
-    def _key_present(source_id: str) -> bool:
-        if source_id == "gmaps":
-            return True                       # no key: it collects for itself
-        return True
+    def _key_present(reg) -> bool:
+        # Read from the environment named by the source, never from a request.
+        if not reg.needs_key:
+            return True
+        return bool(reg.key_env and os.environ.get(reg.key_env))
 
     @app.get("/api/sources")
     def list_sources():
@@ -544,9 +620,9 @@ def create_app() -> FastAPI:
                  # Whether the key is PRESENT, never the key itself. The UI has
                  # to be able to say "set this up first" without ever holding a
                  # secret it would then persist to localStorage.
-                 "key_present": _key_present(r.id),
-                 "ready": (not r.needs_browser
-                           and (not r.needs_key or _key_present(r.id)))}
+                 "key_env": r.key_env,
+                 "key_present": _key_present(r),
+                 "ready": (not r.needs_browser and _key_present(r))}
                 for r in sources.all_sources()]
 
     @app.get("/api/packs")
@@ -597,10 +673,10 @@ def create_app() -> FastAPI:
             raise HTTPException(422, {"problems": problems})
         check_campaign_paths(body.campaign)
         campaign = Campaign.from_dict(body.campaign)
-        if body.durable and not campaign.places:
-            raise HTTPException(
-                422, "a durable run needs places -- it makes each one a unit of "
-                     "work. A file source is a single unit; run it normally.")
+        if body.durable:
+            why = durable_problem(campaign)
+            if why:
+                raise HTTPException(422, why)
         db = store()
         run_id = db.create_run(body.campaign)
         run = Run(run_id, campaign)
@@ -706,7 +782,16 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "no run %s" % run_id)
         # Straight from the ledger, so the answer is the same before and after
         # a restart, and the same whether or not this process ran the job.
-        rows = list(store().results(run_id))
+        #
+        # Filtered and sorted on an outline -- the six fields below, read by
+        # SQLite -- and only the page returned is decoded. Decoding every row
+        # to hand back 200 of them took 17s on a 100,000-row run, on the
+        # request the UI makes the moment a run's results open.
+        db = store()
+        rows = db.outline(run_id)
+        whole = rows is None
+        if whole:
+            rows = db.results(run_id)
         if outcome is not None:
             rows = [r for r in rows if r.get("outcome") == outcome]
         elif qualified is not None:
@@ -728,8 +813,14 @@ def create_app() -> FastAPI:
         elif sort == "name":
             rows = sorted(rows, key=lambda r: str(r.get("name") or "").lower())
 
-        return {"total": len(rows), "offset": offset, "limit": limit,
-                "rows": rows[offset:offset + limit]}
+        page = rows[offset:offset + limit]
+        if not whole:
+            page = db.results_for(run_id, [r["cid"] for r in page])
+        # Returned as JSONResponse directly: the rows came out of json.loads,
+        # so FastAPI's jsonable_encoder pass (2.3s for 5,000 rows) could only
+        # hand back the same structure. The bytes on the wire are identical.
+        return JSONResponse({"total": len(rows), "offset": offset,
+                             "limit": limit, "rows": page})
 
     # `:path` because a cid legitimately contains slashes. The overpass source
     # -- the DEFAULT source -- emits `osm:way/456`, and a plain {cid} segment
@@ -739,9 +830,11 @@ def create_app() -> FastAPI:
     def run_business(run_id: str, cid: str):
         if summary_for(run_id) is None:
             raise HTTPException(404, "no run %s" % run_id)
-        for row in store().results(run_id):
-            if str(row.get("cid", "")).lower() == cid.lower():
-                return {**row, "explain": _explain_row(row)}
+        # A keyed lookup. This scanned the whole run, decoding every row, and
+        # took 12s to open one business's evidence on a 100,000-row run.
+        row = store().find_result(run_id, cid)
+        if row is not None:
+            return {**row, "explain": _explain_row(row)}
         raise HTTPException(404, "no business %s in run %s" % (cid, run_id))
 
     @app.post("/api/runs/{run_id}/rescore")
@@ -756,15 +849,19 @@ def create_app() -> FastAPI:
 
         # Read, rescore, write back. Still no refetching -- the signals are
         # already stored -- but the new ranking now outlives the process too.
+        # The band is recomputed with the score: a row moved from 95 to 40
+        # still said "call today" because only the number was rewritten.
+        campaign = _campaign_for(run_id)
+        bands = ((campaign.scoring if campaign else {}) or {}).get("bands")
         changed = []
-        for row in store().results(run_id):
-            if row.get("outcome") != Outcome.QUALIFIED.value:
-                continue
+        # Only qualified rows are scored, so only those are decoded.
+        for row in qualified_data(run_id):
             verdict = _verdict_from_row(row)
             scoring.score(verdict, body.weights, body.normalise,
                           confidence=body.confidence)
             row["score"] = verdict.score
             row["breakdown"] = verdict.breakdown
+            row["band"] = scoring.band_for(verdict.score, bands)
             changed.append(row)
         store().save_results(run_id, changed)
         return {"rescored": len(changed)}
@@ -799,7 +896,10 @@ def create_app() -> FastAPI:
         before = {str(r.get("cid")): str(r.get("outcome") or "unknown")
                   for r in stored}
         businesses = [_verdict_from_row(r).business for r in stored]
-        verdicts = list(Pipeline(campaign).qualify(businesses))
+        # Paid signals reused as measured: re-judging answers a question about
+        # rules and must not refetch every website to do it.
+        verdicts = list(Pipeline(campaign, reuse=stored_signals(stored))
+                        .qualify(businesses))
 
         changes, shifts = [], {}
         for v in verdicts:
@@ -842,9 +942,10 @@ def create_app() -> FastAPI:
         campaign = _campaign_for(run_id)
         if campaign is None:
             raise HTTPException(422, "run %s has no stored campaign to resume" % run_id)
-        if not campaign.places:
-            raise HTTPException(422, "run %s is not a durable, place-based run"
-                                     % run_id)
+        why = durable_problem(campaign)
+        if why:
+            raise HTTPException(422, "run %s cannot be resumed durably: %s"
+                                     % (run_id, why))
 
         left = store().pending_count(run_id)
         run = Run(run_id, campaign)
@@ -852,7 +953,7 @@ def create_app() -> FastAPI:
         run.started = row["started"] or time.time()
         with _RUNS_LOCK:
             RUNS[run_id] = run
-        store().finish_run(run_id, "running", json.loads(row["stats"] or "{}"))
+        store().set_state(run_id, "running")
         threading.Thread(target=_execute, args=(run,), daemon=True).start()
         return {**run.summary(), "resumed": True, "places_left": left}
 
@@ -880,47 +981,68 @@ def create_app() -> FastAPI:
         summary = summary_for(run_id)
         if summary is None:
             raise HTTPException(404, "no run %s" % run_id)
-        from .cli import _flatten, shape_output, template_fields, render_template
+        from .cli import (_flatten, attributions, csv_safe, render_template,
+                          shape_output, template_fields)
 
-        row_data = run_data(run_id)
+        row_data = run_data(run_id) if include_rejected else qualified_data(run_id)
         campaign = _campaign_for(run_id)
         cfg = (campaign.output if campaign else {}) or {}
-        if not include_rejected:
-            row_data = [r for r in row_data
-                        if r.get("outcome") == Outcome.QUALIFIED.value]
+        # Best first, as the CLI writes it. The ledger returns rows by cid, and
+        # shape_output only sorts when an output block exists -- so a campaign
+        # without one exported its leads in id order, not score order.
+        row_data = sorted(row_data, key=lambda r: -(r.get("score") or 0))
         row_data = shape_output(row_data, cfg)
 
         name = "kerb-%s-%s.%s" % (
             re.sub(r"[^\w.-]+", "-", str(summary.get("name") or "run")).strip("-"),
             run_id[:8], format)
         headers = {"Content-Disposition": 'attachment; filename="%s"' % name}
+        # Licence notices travel with the data, in every format -- the CLI
+        # wrote them and this did not, so data exported from the UI dropped
+        # the attribution OpenStreetMap's licence requires.
+        notes = attributions(row_data)
+        if notes:
+            headers["X-Data-Attribution"] = "; ".join(notes)
 
         if format == "json":
             return StreamingResponse(
-                iter([json.dumps({"results": row_data}, default=str)]),
+                iter([json.dumps({"results": row_data, "attribution": notes},
+                                 default=str)]),
                 media_type="application/json", headers=headers)
         if format == "jsonl":
             return StreamingResponse(
-                (json.dumps(r, default=str) + "\n" for r in row_data),
+                ("".join(json.dumps(r, default=str) + "\n"
+                         for r in row_data[i:i + EXPORT_CHUNK])
+                 for i in range(0, len(row_data), EXPORT_CHUNK)),
                 media_type="application/x-ndjson", headers=headers)
 
         template = cfg.get("template")
         cols = list(template.keys()) if template else list(
             cfg.get("columns") or _default_columns())
+        # The default layout gains an attribution column when the data needs
+        # one. A template or explicit column list is the user's mail-merge
+        # layout, and is left exactly as they wrote it (the header carries it).
+        with_attr = bool(notes) and not template and not cfg.get("columns")
+        if with_attr:
+            cols = cols + ["attribution"]
 
         def rows():
             buf = io.StringIO()
             writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
             writer.writeheader()
-            yield buf.getvalue()
-            for record in row_data:
-                buf.seek(0), buf.truncate(0)
+            for n, record in enumerate(row_data, 1):
+                if n % EXPORT_CHUNK == 0:
+                    yield buf.getvalue()
+                    buf.seek(0), buf.truncate(0)
                 if template:
-                    writer.writerow(render_template(
-                        record, _flatten(record, template_fields(template)), template))
+                    flat = render_template(
+                        record, _flatten(record, template_fields(template)), template)
                 else:
-                    writer.writerow(_flatten(record, cols))
-                yield buf.getvalue()
+                    flat = _flatten(record, cols)
+                    if with_attr:
+                        flat["attribution"] = (record.get("extras") or {}).get("attribution")
+                writer.writerow({k: csv_safe(v) for k, v in flat.items()})
+            yield buf.getvalue()
 
         return StreamingResponse(rows(), media_type="text/csv", headers=headers)
 

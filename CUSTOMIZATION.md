@@ -64,11 +64,11 @@ contact people, you form judgements, and both must stick.
 
 ```yaml
 suppress:
-  - list: contacted.csv          # any file with a cid column
-  - list: not-a-fit.csv          # a human said no; that decision is durable
-  - runs: [a3f9c21, 7b02de4]     # everything a previous run surfaced
-  - domains: [ourclients.com]    # existing clients
-  - after: 180d                  # allow re-surfacing eventually
+  lists: [contacted.csv, not-a-fit.csv]   # any file with a cid column; a human
+                                          # said no, and that decision is durable
+  cids: ["0x4876...:0x3ce..."]            # one-offs, inline
+  runs: [a3f9c21, 7b02de4]                # everything a previous run surfaced
+  after: 180d                             # allow re-surfacing eventually
 ```
 
 Without this, a weekly run hands back the same five hundred leads every week
@@ -82,16 +82,17 @@ and a suppression list with no expiry would hide exactly the lead you most want.
 ### 3.2 Delta runs
 
 ```bash
-kerb run campaign.yaml --since last       # new since the previous run
-kerb run campaign.yaml --since 2026-07-01
-kerb run campaign.yaml --changed          # seen before, but the verdict moved
+kerb run campaign.yaml --since a3f9c21    # hide what that run already surfaced,
+                                          # unless its verdict has since moved
 ```
 
-`--changed` is the interesting one and only becomes possible once results are
+Showing only what CHANGED is the interesting part, and it only becomes possible once results are
 stored. A business whose `site_status` went `live → dead` since last month is
 the highest-intent lead the dataset can produce, and today nothing can find it.
 
-Output gains `first_seen`, `last_seen`, `previous_outcome`.
+Not yet built: output columns `first_seen`, `last_seen` and `previous_outcome`.
+The soft suppression above is what ships -- it knows the previous outcome and
+uses it to decide what to show, but does not yet export it.
 
 ### 3.3 Re-judging stored results
 
@@ -100,10 +101,12 @@ migration. With results in the store, that becomes a command:
 
 ```bash
 kerb requalify <RUN_ID>                  # re-run filters with today's packs
-kerb requalify <RUN_ID> --diff           # show what would change, change nothing
+kerb requalify <RUN_ID>                  # show what would change, change nothing
+kerb requalify <RUN_ID> --apply          # then write it
 ```
 
-Free, since every signal is already stored. `--diff` first is the honest
+Free: FREE signals are recomputed (that is where a changed rule lands) and paid
+ones are reused as stored, so nothing is fetched again. Showing the diff first is the honest
 default — a rule change that silently deletes 23 businesses is how the
 predecessor over-deleted two good ones.
 
@@ -176,8 +179,8 @@ Ship what the operator maintains by hand. Versioned, shareable, diffable:
 
 ```yaml
 where:
-  packs: [geo/uk-affluent-towns, geo/us-metro-top-100]
-  exclude: [geo/already-covered]
+  packs: [geo/uk-affluent, geo/us-metro]
+  exclude: [Bath, Oxford]            # place names, taken out of whatever the packs list
   order: priority
 ```
 
@@ -216,8 +219,9 @@ output:
   columns: [name, phone, website, score, site_status, reject_reason]
   min_score: 70
   top: 200
-  split_by: place            # one file per city, for handing to a caller
-  template: outreach.csv     # mail-merge column names
+  split_by: place_label      # one file per searched place, for handing to a caller
+  # or, instead of columns, mail-merge names -> fields (not both):
+  # template: {Company: name, Phone: phone, Opening: "{name} has {review_count} reviews"}
 ```
 
 `split_by` is small and disproportionately useful: prospecting work is handed
@@ -236,7 +240,7 @@ argument is that uncertainty must stay visible discards it at the last step.
 
 ```yaml
 scoring:
-  confidence: weight     # points *= signal confidence
+  confidence: true       # points *= signal confidence
 ```
 
 Opt-in, because it changes every existing score. Default off; recommended on.

@@ -196,6 +196,82 @@ def test_resume_is_case_insensitive_on_cid():
     print("  resume normalises cids    ok")
 
 
+def test_a_checkpoint_resume_measures_the_unevaluated_again():
+    """Resume skipped every cid in the journal -- including the ones the
+    breaker left unevaluated precisely so the next attempt could measure them.
+    "Unevaluated" became permanent, and the CLI said they were "still queued"."""
+    import json
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    data = TMP / "ckpt.csv"
+    data.write_text("cid,title,category,review_count\n"
+                    "0xc:0x1,Done Dental,Dentist,90\n"
+                    "0xc:0x2,Blip Dental,Dentist,90\n"
+                    "0xc:0x3,New Dental,Dentist,90\n")
+    camp = TMP / "ckpt.yaml"
+    camp.write_text("name: ckpt\nsources: [{id: csv, options: {path: %s}}]\n"
+                    "what: {packs: [trades/dentist]}\n" % data)
+    journal = TMP / "ckpt.jsonl"
+    journal.write_text(
+        json.dumps({"cid": "0xc:0x1", "name": "Done Dental", "outcome": "qualified",
+                    "qualified": True, "score": 50.0}) + "\n" +
+        json.dumps({"cid": "0xc:0x2", "name": "Blip Dental", "outcome": "unevaluated",
+                    "qualified": False}) + "\n")
+    out = TMP / "ckpt-out.json"
+    proc = subprocess.run(
+        [sys.executable, "-m", "kerb", "run", str(camp), "--checkpoint", str(journal),
+         "--include-rejected", "--out", str(out), "-q"],
+        cwd=str(root), capture_output=True, text=True, timeout=120,
+        env={**__import__("os").environ, "PYTHONPATH": str(root)})
+    assert proc.returncode in (0, 3), proc.stderr[-600:]
+    rows = {r["cid"]: r for r in json.loads(out.read_text())["results"]}
+    assert set(rows) == {"0xc:0x1", "0xc:0x2", "0xc:0x3"}, sorted(rows)
+    assert rows["0xc:0x2"]["outcome"] == "qualified", "the unevaluated row was skipped"
+    assert rows["0xc:0x1"]["score"] == 50.0, "a decided row was re-measured"
+    print("  resume re-measures unevaluated ok")
+
+
+def test_a_malformed_campaign_is_explained_not_traced():
+    """The UI's Copy-as-YAML wrote `op: >=`, and `kerb run` answered with a
+    PyYAML traceback. Whatever the cause, a bad file gets a sentence."""
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    bad = TMP / "bad.yaml"
+    bad.write_text("name: x\nfilters:\n  - {signal: reviews, op: >=, value: 3}\n")
+    proc = subprocess.run([sys.executable, "-m", "kerb", "run", str(bad)],
+                          cwd=str(root), capture_output=True, text=True, timeout=60,
+                          env={**__import__("os").environ, "PYTHONPATH": str(root)})
+    assert proc.returncode != 0
+    assert "Traceback" not in proc.stderr, proc.stderr[-400:]
+    assert "not valid YAML" in proc.stderr and "line" in proc.stderr, proc.stderr
+    print("  bad YAML explained        ok")
+
+
+def test_a_missing_measurement_is_never_found_out_not_rejected():
+    """Found by running real-shaped data: a business with no review count was
+    REJECTED with "reviews is None, needs >= 30". The README, the gmaps source
+    and the UI all promise "never found out" -- and Google's signed-out view
+    has no counts at all, so this rejected every Maps business."""
+    data = TMP / "nocount.csv"
+    data.write_text("cid,title,category,review_count\n"
+                    "0xe:0x1,Has Count,Dentist,80\n"
+                    "0xe:0x2,No Count,Dentist,\n"
+                    "0xe:0x3,Few Reviews,Dentist,4\n")
+    pipe = Pipeline(Campaign.from_dict({
+        "sources": [{"id": "csv", "options": {"path": str(data)}}],
+        "what": {"packs": ["trades/dentist"]},
+        "filters": [{"signal": "reviews", "op": ">=", "value": 30}]}))
+    got = {v.business.name: v for v in pipe.run()}
+    assert got["Has Count"].outcome is Outcome.QUALIFIED
+    assert got["Few Reviews"].outcome is Outcome.REJECTED, "a real 4 is still a verdict"
+    unknown = got["No Count"]
+    assert unknown.outcome is Outcome.UNEVALUATED, unknown.reject_reason
+    assert "None" not in unknown.reject_reason and "unknown" in unknown.reject_reason
+    assert pipe.stats.rejected == 1 and pipe.stats.unevaluated == 1
+    assert not pipe.breaker.tripped, "an unknown count is not an outage"
+    print("  missing count not judged  ok")
+
+
 # --------------------------------------------------------------- health wiring
 
 def test_discovery_health_is_reported():
@@ -285,6 +361,9 @@ if __name__ == "__main__":
                test_a_brief_blip_does_not_stop_the_run,
                test_a_run_resumes_instead_of_starting_over,
                test_resume_is_case_insensitive_on_cid,
+               test_a_checkpoint_resume_measures_the_unevaluated_again,
+               test_a_malformed_campaign_is_explained_not_traced,
+               test_a_missing_measurement_is_never_found_out_not_rejected,
                test_discovery_health_is_reported,
                test_breaker_defaults_are_configurable):
         fn()

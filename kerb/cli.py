@@ -110,6 +110,30 @@ def _flatten(v: Dict[str, Any], columns: Optional[List[str]] = None) -> Dict[str
     return {k: row.get(k, v.get(k)) for k in cols}
 
 
+# A phone number or a signed number: starts with + or - and holds nothing a
+# spreadsheet could run. Everything else starting with a formula character is
+# neutralised -- see csv_safe.
+_SIGNED_NUMBER = re.compile(r"^[+-][\d\s().\-/]*$")
+
+
+def csv_safe(value: Any) -> Any:
+    """A cell a spreadsheet will show rather than run.
+
+    Business names are scraped, so they are written by strangers, and a CSV
+    cell starting `=`, `+`, `-` or `@` is executed as a formula by Excel,
+    Sheets and LibreOffice -- `=HYPERLINK(...)` as a business name is enough.
+    Those cells get a leading apostrophe, the conventional "this is text"
+    marker. Phone numbers (`+44 20 ...`) and signed numbers are left alone:
+    they cannot execute, and prefixing every phone in the export would damage
+    the column people export for.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    if value[0] in "=@\t\r" or (value[0] in "+-" and not _SIGNED_NUMBER.match(value)):
+        return "'" + value
+    return value
+
+
 def attributions(verdicts: List[Dict[str, Any]]) -> List[str]:
     """Licence notices the data carries. Emitted automatically, not opt-in --
     a user should not have to remember someone else's licence terms."""
@@ -242,7 +266,7 @@ def _write_one(path: Path, verdicts: List[Dict[str, Any]], fmt: str,
             w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
             for row in rows:
-                w.writerow(row)
+                w.writerow({k: csv_safe(v) for k, v in row.items()})
 
     # A licence notice belongs beside every format, not only the two that
     # happened to have somewhere convenient to put it. All notices, not just
@@ -261,6 +285,9 @@ def cmd_serve(args) -> int:
     import uvicorn
     from . import paths
     os.environ[TAG.split("=")[0]] = "1"
+    # Which address the app is on decides which Host headers it answers; see
+    # api.allowed_hosts. An env var so it also reaches uvicorn's --reload child.
+    os.environ["KERB_BIND_HOST"] = args.host
     # The server confines reads; the CLI never does. `kerb run` is the user's
     # own shell and may read whatever they can.
     roots = paths.confine(paths.from_env() or [Path.cwd()])
@@ -293,7 +320,17 @@ def _load(path: str):
     p = Path(path).expanduser()
     if not p.exists():
         die("no campaign file at %s" % p)
-    raw = yaml.safe_load(p.read_text()) or {}
+    try:
+        raw = yaml.safe_load(p.read_text()) or {}
+    except yaml.YAMLError as exc:
+        # A campaign is hand-edited YAML; a mistake in it is the user's to fix,
+        # and a traceback is not how to tell them where it is.
+        mark = getattr(exc, "problem_mark", None)
+        where = (" (line %d, column %d)" % (mark.line + 1, mark.column + 1)
+                 if mark is not None else "")
+        die("%s is not valid YAML%s: %s.\n       Quote values that start with "
+            "a symbol, e.g. op: \">=\"." % (p, where,
+                                             getattr(exc, "problem", None) or exc))
     problems = validate(raw)
     if problems:
         say(C.bad("this campaign cannot run:"))
@@ -324,10 +361,16 @@ def load_checkpoint(path: Path) -> List[Dict[str, Any]]:
                 continue                    # a partial write; the rest is good
             if isinstance(row, dict) and row.get("cid"):
                 rows.append(row)
-    return rows
+    # A business measured again on a later attempt appears twice; the later
+    # line is the current verdict.
+    latest: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        latest[str(row["cid"]).lower()] = row
+    return list(latest.values())
 
 
 def cmd_run(args) -> int:
+    from .models import Outcome
     from .pipeline import Pipeline
 
     campaign = _load(args.campaign)
@@ -399,14 +442,20 @@ def cmd_run(args) -> int:
             say(C.dim("  ... %d found" % e["found"]))
         elif stage == "stop":
             say(C.warn("  stopped: %s" % e.get("reason")))
-        elif stage == "error":
+        elif stage in ("error", "source_error"):
             say(C.bad("  %s" % e.get("error")))
+        elif stage == "halt":
+            say(C.bad("  halted: %s" % e.get("reason")))
 
     if getattr(args, "durable", False):
         return _run_durable(args, campaign, progress, suppression)
 
+    # Resume skips what was DECIDED. A business we never managed to measure
+    # is not done -- the breaker stopped the run precisely so those could be
+    # measured next time -- and skipping it made "unevaluated" permanent.
     pipe = Pipeline(campaign, on_progress=progress,
-                    skip=[r["cid"] for r in done],
+                    skip=[r["cid"] for r in done
+                          if r.get("outcome") != Outcome.UNEVALUATED.value],
                     suppression=suppression)
     verdicts = []
     interrupted = False
@@ -437,7 +486,12 @@ def cmd_run(args) -> int:
         if journal is not None:
             journal.close()
 
-    rows_all = done + [v.to_dict() for v in verdicts]
+    # Earlier verdicts, overlaid with this attempt's -- a re-measured business
+    # replaces its old unevaluated row rather than appearing twice.
+    merged = {str(r["cid"]).lower(): r for r in done}
+    for v in verdicts:
+        merged[v.business.cid] = v.to_dict()
+    rows_all = list(merged.values())
     if args.include_rejected:
         rows = rows_all
     else:
@@ -458,7 +512,12 @@ def cmd_run(args) -> int:
         say("")
         say(C.warn("  %d business(es) could not be measured -- NOT rejected, "
                    "just unknown." % st.unevaluated))
-        say(C.dim("    Re-run when the source is healthy; they are still queued."))
+        if args.checkpoint:
+            say(C.dim("    Re-run with the same --checkpoint when the source is "
+                      "healthy; only these are measured again."))
+        else:
+            say(C.dim("    Re-run when the source is healthy. With --checkpoint FILE, "
+                      "a re-run measures only what is left."))
     if pipe.breaker.tripped:
         say("")
         for line in textwrap.wrap(st.stopped_reason or "", 74):
@@ -485,11 +544,19 @@ def cmd_run(args) -> int:
         for sid, why in st.source_errors.items():
             say(C.bad("    %-12s %s" % (sid, why)))
     if st.skipped_places:
-        say(C.warn("  %d place(s) skipped:" % len(st.skipped_places)))
+        say(C.warn("  %d place(s) could not be read:" % len(st.skipped_places)))
         for where, why in list(st.skipped_places.items())[:5]:
             say(C.dim("    %-28s %s" % (where, why)))
         if len(st.skipped_places) > 5:
             say(C.dim("    +%d more" % (len(st.skipped_places) - 5)))
+    if st.empty_places:
+        say(C.dim("  %d place(s) searched with nothing found:" % len(st.empty_places)))
+        for where, why in list(st.empty_places.items())[:5]:
+            say(C.dim("    %-28s %s" % (where, why)))
+        if len(st.empty_places) > 5:
+            say(C.dim("    +%d more" % (len(st.empty_places) - 5)))
+    for note in st.notes:
+        say(C.warn("  note: %s" % note))
     if st.elapsed >= 1:
         say(C.dim("  %.1fs" % st.elapsed))
 
@@ -574,9 +641,11 @@ def cmd_estimate(args) -> int:
     # Signals being free does not make the run free: the source still fetches.
     # Saying "no requests" for an overpass campaign that will make two calls per
     # place was simply wrong, in the one command whose job is to predict cost.
-    file_sources = {"csv", "gosom"}
+    from . import sources as src
     src_ids = [s.get("id") if isinstance(s, dict) else s for s in campaign.sources]
-    networked = [s for s in src_ids if s not in file_sources]
+    # Asked of the source, not a list of ids: there has never been a `gosom`
+    # source, and a new file source would have been costed as networked.
+    networked = [s for s in src_ids if src.get(s).takes != "path"]
     if networked:
         if "overpass" in networked and places:
             detail = ("about %d requests -- %d places, each geocoded then queried"
@@ -601,11 +670,14 @@ def _run_durable(args, campaign, progress, suppression=None) -> int:
     from .sources.durable import collect_places
     from .store import Store
 
+    from .campaign import durable_problem
     places = campaign.places
-    if not places:
-        die("--durable is for place-based discovery; this campaign has no places")
+    why = durable_problem(campaign)
+    if why:
+        die("--durable: " + why)
     source_id = next((s.get("id") if isinstance(s, dict) else s)
-                     for s in campaign.sources)
+                     for s in campaign.sources
+                     if not (isinstance(s, dict) and s.get("enabled") is False))
 
     store = Store(Path(args.state_db) if args.state_db else None)
     try:
@@ -668,8 +740,10 @@ def _run_durable(args, campaign, progress, suppression=None) -> int:
         for v in verdicts:
             counts[v.outcome.value] = counts.get(v.outcome.value, 0) + 1
         store.save_results(run_id, [v.to_dict() for v in verdicts])
-        store.update_stats(run_id, {**res.to_dict(), **counts,
-                                    "total": len(verdicts)})
+        # One stats record, written at the end. update_stats() here was
+        # immediately overwritten by finish_run(..., res.to_dict()) below, so
+        # the ledger lost the qualified/rejected counts it had just saved.
+        run_stats = {**res.to_dict(), **counts, "total": len(verdicts)}
 
         rows = [v.to_dict() for v in verdicts]
         if not args.include_rejected:
@@ -685,7 +759,7 @@ def _run_durable(args, campaign, progress, suppression=None) -> int:
         if st.unevaluated:
             say(C.warn("    %d could not be measured -- NOT rejected" % st.unevaluated))
 
-        store.finish_run(run_id, "done" if not left else "running", res.to_dict())
+        store.finish_run(run_id, "done" if not left else "running", run_stats)
         if args.out:
             out = Path(args.out).expanduser()
             fmt = args.format or (out.suffix.lstrip(".") if out.suffix.lstrip(".")
@@ -713,7 +787,7 @@ def cmd_requalify(args) -> int:
     import yaml
     from .campaign import Campaign, validate
     from .models import Business
-    from .pipeline import Pipeline
+    from .pipeline import Pipeline, stored_signals
     from .store import Store
 
     store = Store(Path(args.state_db) if args.state_db else None)
@@ -744,7 +818,10 @@ def cmd_requalify(args) -> int:
         businesses = [Business(**{k: v for k, v in r.items() if k in fields})
                       for r in stored]
 
-        pipe = Pipeline(campaign)
+        # FREE signals are recomputed -- that is where a changed pack or rule
+        # takes effect. Paid ones are reused as stored, so this really is free:
+        # it recomputed everything, refetching every website it had checked.
+        pipe = Pipeline(campaign, reuse=stored_signals(stored))
         verdicts = list(pipe.qualify(businesses))
 
         moved = [(v, before.get(v.business.cid, "unknown")) for v in verdicts
@@ -928,16 +1005,25 @@ def cmd_reviews(args) -> int:
         say('  pip install "kerb[browser]"')
         return 1
 
-    store = Store()
-    if store.get_run(args.run) is None:
-        say(C.bad("no run %r in the ledger" % args.run))
-        say("  `kerb jobs` lists what is there")
-        return 1
+    store = Store(Path(args.state_db) if getattr(args, "state_db", None) else None)
+    try:
+        if store.get_run(args.run) is None:
+            say(C.bad("no run %r in the ledger at %s" % (args.run, store.path)))
+            say("  `kerb jobs` lists what is there")
+            return 1
+        stored = store.results(args.run)
+    finally:
+        store.close()
 
-    rows = [r for r in store.results(args.run)
-            if args.all or (r.get("outcome") == "qualified")]
-    rows = [r for r in rows if (r.get("extras") or {}).get("maps_url")
-            or str(r.get("cid") or "").startswith("0x")]
+    rows = [r for r in stored if args.all or (r.get("outcome") == "qualified")]
+    # The harvest swaps each business's hex cid into one captured request, so
+    # only a `0x...:0x...` cid can be harvested. A row with a decimal id or an
+    # OSM id used to be passed through and fail inside the browser.
+    usable = [r for r in rows if _HEX_CID.match(str(r.get("cid") or ""))]
+    if len(usable) < len(rows):
+        say(C.dim("  %d business(es) skipped: no Google Maps id to address them by"
+                  % (len(rows) - len(usable))))
+    rows = usable
     if args.limit:
         rows = rows[:args.limit]
     if not rows:
@@ -948,7 +1034,7 @@ def cmd_reviews(args) -> int:
 
     out_path = Path(args.out or ("reviews-%s.jsonl" % args.run))
     say(C.bold("harvesting reviews"), C.dim("%d business(es) -> %s" % (len(rows), out_path)))
-    say(C.dim("  one browser, reused; the request is captured once per place"))
+    say(C.dim("  one browser; one request captured, then reused for every business"))
 
     total, failed = 0, 0
     from .reviews import harvest_many
@@ -989,6 +1075,9 @@ def cmd_reviews(args) -> int:
            ", %d could not be read" % failed if failed else ""))
     say("  ->", C.bold(str(out_path)))
     return 0 if total else 1
+
+
+_HEX_CID = re.compile(r"^0x[0-9a-f]+:0x[0-9a-f]+$", re.I)
 
 
 def _maps_url(cid: str) -> str:
@@ -1110,9 +1199,14 @@ def cmd_doctor(args) -> int:
 # port. A cleanup command that cannot see its own processes is worse than none,
 # because it is trusted.
 STRONG_PATTERNS = [re.compile(p, re.I) for p in (
-    r"--user-data-dir=\S*kerb-worker",     # a browser kerb started, and only kerb
-    r"chromedriver\S*\s+--kerb\b",
+    # A browser kerb started, and only kerb: signals/detail.py gives every
+    # Chrome it launches a `kerb-worker-*` profile directory. chromedriver
+    # itself has no such tag -- it is found through kerb/procs.py's registry.
+    r"--user-data-dir=\S*kerb-worker",
 )]
+# A registered pid is only trusted while it still looks like a browser: pids are
+# reused, and a stale registry entry must never aim `kerb stop` at a stranger.
+BROWSERISH = re.compile(r"chrom", re.I)
 WEAK_PATTERNS = [re.compile(p, re.I) for p in (
     r"\buvicorn\s+kerb\.api",
     r"\bkerb\.api:app\b",
@@ -1149,9 +1243,18 @@ def _ps() -> List[Dict[str, Any]]:
         except (OSError, subprocess.SubprocessError):
             out = None
     else:
+        # -ww: unlimited width. Without it ps truncates every command line to
+        # $COLUMNS whenever that is exported -- 80 characters under pytest and
+        # in plenty of shells -- and a browser's tag (`--user-data-dir=...
+        # kerb-worker`) sits far past column 80 of a Chrome command line. The
+        # process was running; `kerb stop` simply could not read far enough to
+        # recognise it. COLUMNS is dropped as well, for any ps that honours it
+        # over the flag.
+        env = {k: v for k, v in os.environ.items() if k != "COLUMNS"}
         try:
-            out = subprocess.run(["ps", "-eo", "pid=,ppid=,command="],
-                                 capture_output=True, text=True, timeout=15).stdout
+            out = subprocess.run(["ps", "-ww", "-eo", "pid=,ppid=,command="],
+                                 capture_output=True, text=True, timeout=15,
+                                 env=env).stdout
         except (OSError, subprocess.SubprocessError):
             out = None
     if out is None:
@@ -1184,18 +1287,48 @@ def find_managed() -> List[Dict[str, Any]]:
         protected.add(cur)
         cur = (by_pid.get(cur) or {}).get("ppid", 0)
 
+    # Browsers recorded at launch, and everything under them. Descendants are
+    # included whatever their command line: a renderer or GPU helper does not
+    # say "chrome" reliably, and it is exactly what an orphaned tree leaves.
+    from . import procs
+    seeds = [r["pid"] for r in rows
+             if r["pid"] in procs.registered_pids() and BROWSERISH.search(r["cmd"])]
+    tree = procs.descendants(rows, seeds)
+
     found = []
     for r in rows:
         if r["pid"] in protected:
             continue
         cmd = r["cmd"]
-        if any(p.search(cmd) for p in STRONG_PATTERNS):
+        if r["pid"] in tree or any(p.search(cmd) for p in STRONG_PATTERNS):
             found.append(r)
             continue
         exe = os.path.basename(cmd.split()[0]) if cmd.split() else ""
         if EXE_OK.match(exe) and any(p.search(cmd) for p in WEAK_PATTERNS):
             found.append(r)
     return found
+
+
+def _forget_dead_browsers() -> None:
+    """After a verified stop: drop registry entries whose processes are gone,
+    and the throwaway profile directories they were using."""
+    import shutil
+    from . import procs
+    try:
+        # Alive AND still a browser: the same trust rule find_managed uses. A
+        # recorded pid now held by some other program is not our browser, and
+        # counting it as alive would keep the entry forever.
+        alive = {r["pid"] for r in _ps() if BROWSERISH.search(r["cmd"])}
+    except CannotEnumerate:
+        return
+    for entry in procs.registered():
+        pids = entry.get("pids") or []
+        if any(p in alive for p in pids):
+            continue
+        profile = entry.get("profile_dir") or ""
+        if "kerb-worker" in os.path.basename(profile.rstrip("/\\")):
+            shutil.rmtree(profile, ignore_errors=True)
+        procs.forget(owner=None, pids=pids)
 
 
 def cmd_stop(args) -> int:
@@ -1217,6 +1350,7 @@ def cmd_stop(args) -> int:
         say(C.dim("  Close any kerb server and browser windows by hand."))
         return 1
     if not procs:
+        _forget_dead_browsers()
         say(C.good("nothing to stop"), C.dim("- clean"))
         return 0
 
@@ -1244,6 +1378,7 @@ def cmd_stop(args) -> int:
         for p in left:
             say(C.dim("    %s %s" % (p["pid"], p["cmd"])))
         return 1
+    _forget_dead_browsers()
     say(C.good("  clean"), C.dim("- verified, nothing left"))
     return 0
 
@@ -1336,6 +1471,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="stop after this many reviews per business")
     rv.add_argument("--all", action="store_true",
                     help="every business in the run, not just the qualified ones")
+    rv.add_argument("--state-db", metavar="FILE",
+                    help="where the ledger lives (default: $KERB_STATE_DB, "
+                         "else ~/.kerb/state/kerb.db)")
     rv.set_defaults(fn=cmd_reviews)
 
     sub.add_parser("doctor", help="check this install").set_defaults(fn=cmd_doctor)

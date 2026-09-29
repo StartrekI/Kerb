@@ -12,8 +12,17 @@ from datetime import datetime, timezone
 from ..models import Business, Cost, Liveness, Signal
 from . import Context, signal
 
-PERM = ("permanently closed",)
-TEMP = ("temporarily closed",)
+# Both word orders, because sources disagree: Maps writes "Permanently closed",
+# the Places API writes CLOSED_PERMANENTLY. Only the second spelling reached
+# here unnormalised and read as OPEN, so a closed-down business qualified.
+PERM = ("permanently closed", "closed permanently")
+TEMP = ("temporarily closed", "closed temporarily")
+
+
+def _opt_int(ctx: Context, key: str, default: int) -> int:
+    """A threshold from the campaign, where 0 is a real answer, not "unset"."""
+    value = ctx.opt("liveness", key)
+    return default if value is None else int(value)
 
 
 @signal(name="liveness", cost=Cost.FREE, version=1,
@@ -22,8 +31,8 @@ TEMP = ("temporarily closed",)
         kind="categorical", values=["open", "temp_closed", "perm_closed", "stale", "unknown"],
         suggest={"op": "==", "value": "open", "default_on": True})
 def liveness(biz: Business, ctx: Context) -> Signal:
-    raw = (biz.status_raw or "").strip()
-    low = raw.lower()
+    raw = str(biz.status_raw or "").strip()
+    low = " ".join(raw.lower().replace("_", " ").split())
 
     for marker in PERM:
         if marker in low:
@@ -44,8 +53,8 @@ def liveness(biz: Business, ctx: Context) -> Signal:
     # What this deliberately cannot see: a business that was busy and recently
     # went quiet. No listing carries a last-activity date, and inferring one
     # from a first-review year would be a guess presented as a measurement.
-    months = int(ctx.opt("liveness", "stale_after_months", 24) or 24)
-    max_reviews = int(ctx.opt("liveness", "stale_max_reviews", 3) or 3)
+    months = _opt_int(ctx, "stale_after_months", 24)
+    max_reviews = _opt_int(ctx, "stale_max_reviews", 3)
     year = biz.first_review_year
     if year:
         age_years = datetime.now(timezone.utc).year - int(year)

@@ -39,12 +39,15 @@ OPS = {
     "not in": lambda a, b: a not in b if isinstance(b, (list, tuple, set)) else a != b,
     "is":     lambda a, b: bool(a) is bool(b),
 }
+# Numeric comparisons. Kept apart from OPS because unknown values never satisfy
+# them, where OPS compares whatever it is given.
+ORDERING = (">", ">=", "<", "<=")
 
 
 def _compare(op: str, actual, want) -> bool:
     if op in OPS:
         return OPS[op](actual, want)
-    if op in (">", ">=", "<", "<="):
+    if op in ORDERING:
         a, b = _as_number(actual), _as_number(want)
         if a is None or b is None:
             return False                      # unknown never satisfies an ordering
@@ -68,6 +71,25 @@ def _resolve(verdict: Verdict, path: str):
 def _signal_failed(verdict: Verdict, path: str) -> bool:
     s = verdict.signals.get(path.split(".")[0])
     return bool(s is not None and s.failed)
+
+
+def _signal_unknown(verdict: Verdict, path: str, actual) -> Optional[str]:
+    """Why this value is unknown, if the signal itself says it could not tell.
+
+    A signal that answers None at confidence 0 -- no review count on the
+    record, no dated review to take a year from -- measured correctly and
+    learned nothing. Failing a condition on that nothing used to REJECT the
+    business with "reviews is None, needs >= 30": a verdict about the business
+    built from a measurement that was never taken, which is what the whole
+    three-outcome design exists to prevent. It is not judged instead.
+    """
+    if actual is not None:
+        return None
+    s = verdict.signals.get(path.split(".")[0])
+    if s is None or s.confidence > 0.0:
+        return None
+    note = (s.evidence or {}).get("note") if isinstance(s.evidence, dict) else None
+    return note or "no value to compare"
 
 
 def evaluate(verdict: Verdict, rules: List[Dict[str, Any]],
@@ -116,6 +138,10 @@ def evaluate(verdict: Verdict, rules: List[Dict[str, Any]],
                 err = (verdict.signals[path.split(".")[0]].evidence or {}).get("error")
                 return False, "unmeasurable:%s" % path, \
                     "%s could not be measured (%s) -- not judged" % (path, err)
+            unknown = _signal_unknown(verdict, path, actual)
+            if unknown:
+                return False, "unmeasurable:%s" % path, \
+                    "%s is unknown (%s) -- not judged" % (path, unknown)
             return False, path, "%s is %r, needs %s %r" % (path, actual, op, want)
     return True, None, None
 
@@ -162,6 +188,13 @@ def check_weight(name: str, spec) -> List[str]:
             "full points (e.g. cap: 300 means 300+ reviews score full marks). "
             "Without one there is nothing to scale against and every business "
             "scores identically." % name)
+    if "invert" in spec and not isinstance(spec["invert"], bool):
+        problems.append("weight for %r: invert must be true or false" % name)
+    unknown = set(spec) - {"weight", "scale", "cap", "invert"}
+    if unknown:
+        problems.append("weight for %r has unknown key(s) %s; a scaled weight takes "
+                        "weight, scale, cap and invert"
+                        % (name, ", ".join(sorted(map(repr, unknown)))))
     return problems
 
 
@@ -172,6 +205,8 @@ def _points(value, spec) -> float:
       40                        award the full weight if the signal is truthy
       {none: 40, builder: 20}   categorical, points per value
       {weight: 25, scale: log, cap: 300}   numeric, scaled against cap
+      {weight: 25, scale: log, cap: 10, invert: true}   numeric, lower is better
+                                (chain_size: an independent beats a branch)
     """
     problems = check_weight("?", spec)
     if problems:
@@ -196,7 +231,10 @@ def _points(value, spec) -> float:
             frac = math.log10(n + 1) / math.log10(cap + 1)
         else:
             frac = n / cap
-        return weight * max(0.0, min(1.0, frac))
+        frac = max(0.0, min(1.0, frac))
+        if spec.get("invert"):
+            frac = 1.0 - frac
+        return weight * frac
 
     # Categorical map.
     key = value.value if hasattr(value, "value") else value

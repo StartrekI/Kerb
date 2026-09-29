@@ -204,7 +204,7 @@ All endpoints are same-origin. `GET` unless noted.
 ### 4.1 Boot (call all four in parallel on load)
 
 ```
-GET /api/health   → {"status":"ok","version":"0.1.0","signals":14,"sources":3,"packs":14}
+GET /api/health   → {"status":"ok","version":"0.1.0","signals":15,"sources":3,"packs":14}
 GET /api/signals  → [Signal]   (see table below)
 GET /api/sources  → [Source]
 GET /api/packs    → [Pack]
@@ -217,8 +217,9 @@ GET /api/packs    → [Pack]
   "needs_key":false, "needs_browser":false, "ready":true,
   "legal_note":"Uses data you already hold. Kerb fetches nothing." }
 ```
-Three sources exist: `csv`, `gosom` (both need a **file path**) and `overpass`
-(needs a **list of places**). `legal_note` must be displayed — for `overpass` it
+Three sources exist: `csv` (needs a **file path**), and `gmaps` and `overpass`
+(both need a **list of places**). Read the field from the source's `takes`
+(`path` or `places`), never from its id. `legal_note` must be displayed — for `overpass` it
 carries an ODbL attribution requirement.
 
 **Pack:** `{"id":"trades/dentist","kind":"trades","label":"Dentist","counts":{"categories":8,"keywords":5,"veto_categories":3}}`
@@ -242,11 +243,12 @@ behind the registry, so the UI could not express things the config file could.
 | `rating_band` | Rating band | categorical | free | excellent, good, mixed, poor, unrated, unknown | — |
 | `review_integrity` | Review integrity | categorical | free | complete, truncated, unavailable | — |
 | `review_velocity` | Review velocity | number | free | — | — |
-| `establishment_age` | Establishment age | number | free | — | — |
+| `establishment_age` | First review year | number | free | — | — (a year: `rank: false`) |
 | `name_script` | Name script | categorical | free | latin, cyrillic, greek, arabic, hebrew, devanagari, han, hiragana, katakana, hangul, thai, tamil, bengali, telugu, unknown | `in [latin]` |
 | `site_status` | Website status | categorical | **cheap** | live, dead, parked, placeholder, no_site, unknown | `in [dead, parked, placeholder, no_site]` |
 | `site_platform` | Site platform | categorical | **cheap** | wix, squarespace, shopify, wordpress, godaddy, weebly, webflow, duda, square, facebook, custom, unknown | — |
 | `site_contact` | Contact on site | text | **cheap** | — | — |
+| `reviews_live` | Review count (fetched) | number | **expensive** | — | — |
 
 Render `categorical` as multi-select chips when the operator is `in`, a dropdown
 when `==`; `number` as a numeric input; `boolean` as a two-option select. `text`
@@ -391,7 +393,7 @@ Must contain, laid out to use the full width:
    a places textarea. Show the source's `legal_note`.
 2. **What counts as the trade** — trade pack picker, with that pack's counts
    (categories / keywords / vetoes) so the choice is informed.
-3. **What disqualifies** — all ~13 filters, generated from `/api/signals`, each with
+3. **What disqualifies** — every filterable signal, generated from `/api/signals`, each with
    an on/off toggle, its control, its description, and a cost badge if not free.
    These vary wildly in height (a number input is one line; `name_script` is fifteen
    chips), so **a plain CSS grid leaves holes the height of the tallest cell** — use
@@ -576,7 +578,7 @@ trouble renders. Keep these callable with no side effects beyond re-rendering.
 ```bash
 python3 -m kerb serve --port 8811          # then, headless:
 #   /assets/_smoke.html?w=1500&h=1250&theme=dark   → 65 checks, errors=[], DONE=1
-python3 -m pytest tests/ -q                # → 152 passed
+python3 -m pytest tests/ -q                # → 235 passed
 python3 -m kerb stop                       # → clean, nothing left
 ```
 

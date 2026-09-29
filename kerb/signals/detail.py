@@ -29,9 +29,13 @@ guesses a count: a wrong review count silently changes every score that uses it.
 
 from __future__ import annotations
 
+import atexit
+import os
 import re
+import shutil
+import tempfile
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..models import Business, Cost, Signal
 from . import Context, signal
@@ -70,27 +74,93 @@ HAVE_SELENIUM = _Lazy()
 INSTALL_HINT = ('needs a browser: pip install "kerb[browser]"')
 
 # "1,234 reviews", "(1,234)", "1.2K reviews" -- Maps renders all three depending
-# on locale and surface, so all three are read rather than one guessed.
+# on locale and surface, so all three are read rather than one guessed. The
+# number token may carry a K/M suffix; _number decides what it means.
+_NUM = r'(\d[\d,\.   ]*\d|\d)\s*([KkMm](?![a-z]))?'
 _PATTERNS = (
-    re.compile(r'([\d][\d,\.]*)\s*(?:Google\s+)?reviews?', re.I),
-    re.compile(r'\(\s*([\d][\d,\.]*)\s*\)'),
-    re.compile(r'"([\d][\d,\.]*)\s*reviews?"', re.I),
+    re.compile(_NUM + r'\s*(?:Google\s+)?reviews?\b', re.I),
+    re.compile(r'\(\s*' + _NUM + r'\s*\)'),
 )
+
+# Thousands grouped with a comma, dot or (narrow) space: 1,234  1.234  1 234.
+_GROUPED = re.compile(r'^\d{1,3}(?:[,\.   ]\d{3})+$')
+
+
+def _number(digits: str, suffix: Optional[str]) -> Optional[int]:
+    """A review count out of one token, or None when it is not one.
+
+    Stripping every dot and comma read a rating in brackets, "(4.8)", as 48
+    reviews, and never read "1.2K reviews" at all.
+    """
+    token = digits.strip()
+    if suffix:
+        try:
+            value = float(token.replace(",", "."))
+        except ValueError:
+            return None
+        return int(round(value * (1000 if suffix.lower() == "k" else 1_000_000)))
+    if token.isdigit():
+        return int(token)
+    if _GROUPED.match(token):
+        return int(re.sub(r"\D", "", token))
+    return None                       # a decimal: a rating, not a count
 
 _LOCK = threading.Lock()
 _DRIVER = None                                  # one browser, reused across calls
+_PROFILE_DIR: Optional[str] = None              # the throwaway profile, if ours
+_ATEXIT = False
 
 
 def _count(text: str) -> Optional[int]:
     """First plausible review count in a blob of page text."""
     for pat in _PATTERNS:
-        for raw in pat.findall(text or ""):
-            cleaned = raw.replace(",", "").replace(".", "")
-            if cleaned.isdigit():
-                n = int(cleaned)
-                if 0 < n < 10_000_000:
-                    return n
+        for digits, suffix in pat.findall(text or ""):
+            n = _number(digits, suffix)
+            if n is not None and 0 < n < 10_000_000:
+                return n
     return None
+
+
+def chrome_args(profile, user_data_dir: str) -> List[str]:
+    """Every command-line argument the review browser is launched with.
+
+    Separate from _driver so it can be checked without a browser -- in
+    particular that the profile directory carries the `kerb-worker` tag
+    `kerb stop` looks for.
+    """
+    return [
+        "--user-data-dir=" + user_data_dir,
+        "--headless=new",
+        # A tall viewport loads more per screen; carried over from the
+        # predecessor, which measured it as meaningfully fewer rounds.
+        "--window-size=1500,2400",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--lang=en-US",
+        "--disable-notifications",
+        "--mute-audio",
+        # An explicit desktop UA. Without one Chrome sends a HeadlessChrome
+        # token and Google serves the reduced view -- rating, no Reviews tab.
+        "--user-agent=" + profile.user_agent,
+        "--disable-blink-features=AutomationControlled",
+    ]
+
+
+def _profile_dir() -> Tuple[str, bool]:
+    """(user-data-dir, whether Kerb owns it and must delete it on close).
+
+    An existing Chrome profile directory, if one is offered: cookies in kerb's
+    own jar cover most of it, but a real profile carries the whole signed-in
+    session -- which is what the review RPC needs. Otherwise a throwaway one
+    named `kerb-worker-*`, which is what lets `kerb stop` recognise this
+    browser even after its parent has died. Chrome's own default is an
+    anonymous temp directory that no cleanup command can tell from the user's.
+    """
+    given = os.environ.get("KERB_CHROME_PROFILE")
+    if given:
+        return os.path.abspath(os.path.expanduser(given)), False
+    return tempfile.mkdtemp(prefix="kerb-worker-"), True
 
 
 def _driver(profile):
@@ -100,38 +170,34 @@ def _driver(profile):
     leak: every launch is a Chrome plus its helper children, and a crash
     between launch and quit orphans all of them.
     """
-    global _DRIVER
+    global _DRIVER, _PROFILE_DIR
     with _LOCK:
         if _DRIVER is not None:
             return _DRIVER
         webdriver, Options = _selenium()
         opts = Options()
-        # An existing Chrome profile directory, if one is offered. Cookies in
-        # kerb's own jar cover most of it, but a real profile carries the whole
-        # signed-in session -- which is what the review RPC needs and what the
-        # predecessor's `signin.py` produced.
-        import os as _os
-        udd = _os.environ.get("KERB_CHROME_PROFILE")
-        if udd:
-            opts.add_argument("--user-data-dir=" + _os.path.abspath(_os.path.expanduser(udd)))
-        opts.add_argument("--headless=new")
-        # A tall viewport loads more per screen; carried over from the
-        # predecessor, which measured it as meaningfully fewer rounds.
-        opts.add_argument("--window-size=1500,2400")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--lang=en-US")
-        opts.add_argument("--disable-notifications")
-        opts.add_argument("--mute-audio")
-        # An explicit desktop UA. Without one Chrome sends a HeadlessChrome
-        # token and Google serves the reduced view -- rating, no Reviews tab.
-        opts.add_argument("--user-agent=" + profile.user_agent)
-        opts.add_argument("--disable-blink-features=AutomationControlled")
+        udd, owned = _profile_dir()
+        for arg in chrome_args(profile, udd):
+            opts.add_argument(arg)
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
         opts.add_experimental_option("prefs", {"intl.accept_languages": "en,en_US"})
-        drv = webdriver.Chrome(options=opts)
+        try:
+            drv = webdriver.Chrome(options=opts)
+        except Exception:
+            if owned:
+                shutil.rmtree(udd, ignore_errors=True)
+            raise
+        _PROFILE_DIR = udd if owned else None
+        _register(drv, udd)
+        # Nothing else closes the browser when a `kerb run` simply finishes:
+        # the process exits, and chromedriver and Chrome are left behind as
+        # orphans. An exit hook closes it on every normal exit; a kill -9 is
+        # what the tag and the registry above are for.
+        global _ATEXIT
+        if not _ATEXIT:
+            atexit.register(close)
+            _ATEXIT = True
         drv.set_page_load_timeout(60)
         try:
             drv.execute_cdp_cmd(
@@ -169,13 +235,36 @@ def _driver(profile):
         return _DRIVER
 
 
+def _register(drv, udd: str) -> None:
+    """Write the launched chromedriver and its browser tree to the registry,
+    so `kerb stop` from any other process can find them. Best effort: a
+    registry that cannot be written must not stop the browser working."""
+    try:
+        from .. import procs
+        pid = drv.service.process.pid
+        pids = {pid}
+        try:
+            from ..cli import _ps
+            pids |= procs.descendants(_ps(), [pid])
+        except Exception:                       # noqa: BLE001
+            pass
+        procs.register(sorted(pids), udd)
+    except Exception:                           # noqa: BLE001
+        pass
+
+
+def in_use() -> bool:
+    return _DRIVER is not None
+
+
 def close() -> None:
     """Shut the browser. Called by `kerb stop` and at the end of a run.
 
     The predecessor's worst failure was a driver that outlived its run, so
-    closing is a named, callable thing rather than a hope.
+    closing is a named, callable thing rather than a hope. It also deletes the
+    throwaway profile and forgets the registry entry, so neither piles up.
     """
-    global _DRIVER
+    global _DRIVER, _PROFILE_DIR
     with _LOCK:
         if _DRIVER is not None:
             try:
@@ -183,6 +272,14 @@ def close() -> None:
             except Exception:                   # noqa: BLE001
                 pass
             _DRIVER = None
+            try:
+                from .. import procs
+                procs.forget()
+            except Exception:                   # noqa: BLE001
+                pass
+        if _PROFILE_DIR:
+            shutil.rmtree(_PROFILE_DIR, ignore_errors=True)
+            _PROFILE_DIR = None
 
 
 @signal(name="reviews_live", cost=Cost.EXPENSIVE, version=1,
@@ -190,7 +287,7 @@ def close() -> None:
         description="Opens the business's own Maps page to read its review "
                     "count. One browser page per business -- so it only runs on "
                     "what already survived every cheaper condition.",
-        kind="number")
+        kind="number", rank={"scale": "log", "cap": 300})
 def reviews_live(biz: Business, ctx: Context) -> Signal:
     if not HAVE_SELENIUM:
         return Signal("reviews_live", None, 0.0, {"error": INSTALL_HINT})
@@ -206,6 +303,9 @@ def reviews_live(biz: Business, ctx: Context) -> Signal:
     from ..session import Profile
     try:
         drv = _driver(Profile.load())
+        # One page load is at least one request to Google, and the run's
+        # request budget has to see it like any other.
+        ctx.note_request(1)
         drv.get(url)
         text = drv.find_element("tag name", "body").text
     except Exception as exc:                    # noqa: BLE001

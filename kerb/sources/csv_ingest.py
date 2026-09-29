@@ -32,22 +32,99 @@ CID_PARAM_RE = re.compile(r"[?&]cid=(\d+)")
 
 # Canonical field -> the column names different tools use for it. Order is
 # priority: the first header present wins.
+#
+# Every name here is lowercase, because headers are compared lowercased: Apify's
+# `categoryName` arrives as `categoryname`. Apify was DETECTED as a profile and
+# then mapped by none of its own names -- no category, rating or review count --
+# and its `categories` list was taken as the category instead.
 ALIASES: Dict[str, List[str]] = {
     "cid":          ["cid", "place_id", "placeid", "google_id", "fid", "data_id"],
     "name":         ["name", "title", "business_name", "businessname", "company"],
-    "category":     ["category", "categories", "type", "main_category", "primary_category"],
+    "category":     ["category", "categoryname", "main_category", "primary_category",
+                     "type", "categories"],
     "address":      ["address", "full_address", "formatted_address", "street_address"],
-    "phone":        ["phone", "phone_number", "telephone", "international_phone_number"],
+    "phone":        ["phone", "phone_number", "telephone", "international_phone_number",
+                     "phoneunformatted"],
     "website":      ["website", "site", "web_site", "url", "domain"],
     "booking_url":  ["booking_url", "reservation_url", "book_online", "reserve_url"],
-    "rating":       ["rating", "review_rating", "stars", "average_rating", "score"],
-    "review_count": ["review_count", "reviews", "reviews_count", "user_ratings_total",
-                     "number_of_reviews", "review_number"],
+    "rating":       ["rating", "review_rating", "stars", "average_rating", "score",
+                     "totalscore"],
+    "review_count": ["review_count", "reviews", "reviews_count", "reviewscount",
+                     "user_ratings_total", "number_of_reviews", "review_number"],
     "lat":          ["lat", "latitude"],
     "lng":          ["lng", "lon", "long", "longitude"],
-    "status_raw":   ["status", "business_status", "permanently_closed", "state"],
+    "status_raw":   ["status", "business_status", "state"],
     "maps_url":     ["maps_url", "link", "google_maps_url", "url_maps", "google_url"],
 }
+
+# Closure written as a yes/no column rather than a status sentence. Mapped as a
+# status, `permanently_closed: True` reached liveness as the text "True" -- which
+# contains no closure wording, so a closed business was read as OPEN.
+CLOSURE_FLAGS = {
+    "permanently_closed": "Permanently closed",
+    "permanentlyclosed": "Permanently closed",
+    "temporarily_closed": "Temporarily closed",
+    "temporarilyclosed": "Temporarily closed",
+}
+
+# Where a coordinate pair nests under one column (Apify `location`, SerpApi
+# `gps_coordinates`), rather than sitting in two.
+NESTED_COORDS = ("location", "gps_coordinates", "coordinates", "geometry")
+
+
+def _truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    return str(v or "").strip().lower() in ("true", "yes", "y", "1", "t")
+
+
+def _scalar(v: Any) -> Any:
+    """One value for one field. A list (Apify's `categories`) gives its first
+    entry, most specific first; a mapping gives nothing -- it stays in extras."""
+    if isinstance(v, (list, tuple)):
+        for item in v:
+            if item not in (None, "") and not isinstance(item, (list, tuple, dict)):
+                return item
+        return None
+    if isinstance(v, dict):
+        return None
+    return v
+
+
+def closure_keys(headers) -> List[Any]:
+    """The header names that are closure flags. Worked out once per file: the
+    columns do not change between rows, and scanning every column of every row
+    for them cost a measurable share of a 100,000-row import."""
+    return [h for h in headers if str(h).strip().lower() in CLOSURE_FLAGS]
+
+
+def coord_keys(headers) -> List[Any]:
+    return [h for h in headers if str(h).strip().lower() in NESTED_COORDS]
+
+
+def closure_status(row: Dict[str, Any], keys=None) -> Optional[str]:
+    """A closure sentence liveness understands, from yes/no columns, or None."""
+    for key in (row if keys is None else keys):
+        sentence = CLOSURE_FLAGS.get(str(key).strip().lower())
+        if sentence and _truthy(row.get(key)):
+            return sentence
+    return None
+
+
+def nested_coords(row: Dict[str, Any], keys=None):
+    """(lat, lng) from a nested location mapping, or (None, None)."""
+    for key in (row if keys is None else keys):
+        value = row.get(key)
+        if str(key).strip().lower() not in NESTED_COORDS or not isinstance(value, dict):
+            continue
+        lower = {str(k).lower(): v for k, v in value.items()}
+        lat = lower.get("lat", lower.get("latitude"))
+        lng = lower.get("lng", lower.get("lon", lower.get("longitude")))
+        if lat is not None and lng is not None:
+            return _num(lat), _num(lng)
+    return None, None
 
 # Header signatures that identify a known producer, for auto-mapping.
 PROFILES = {
@@ -302,13 +379,16 @@ def inspect(path: str) -> Dict[str, Any]:
         total += 1
         if not extract_cid(row, mapping):
             missing_cid += 1
+    understood = set(mapping.values()) | {
+        h for h in headers if str(h).strip().lower() in CLOSURE_FLAGS
+        or str(h).strip().lower() in NESTED_COORDS}
     return {
         "path": str(p),
         "rows": total,
         "columns": headers,
         "detected_profile": detect_profile(headers),
         "mapping": mapping,
-        "unmapped_columns": [h for h in headers if h not in mapping.values()],
+        "unmapped_columns": [h for h in headers if h not in understood],
         "rows_without_identity": missing_cid,
         "warning": ("%d rows have no cid or Maps URL and will be skipped -- "
                     "identity cannot be invented" % missing_cid) if missing_cid else None,
@@ -337,6 +417,7 @@ def csv_source(q: SourceQuery) -> Iterator[Business]:
     headers = [h for h in first.keys() if h is not None and h != EXTRA_KEY]
     mapping = build_mapping(headers, q.options.get("mapping"))
     profile = detect_profile(headers) or "custom"
+    flags, coords = closure_keys(headers), coord_keys(headers)
 
     emitted = 0
     for row in itertools.chain([first], stream):
@@ -345,22 +426,33 @@ def csv_source(q: SourceQuery) -> Iterator[Business]:
             continue
         def col(field):
             key = mapping.get(field)
-            v = row.get(key) if key else None
+            v = _scalar(row.get(key)) if key else None
             return None if v in ("", None) else v
+
+        def text(field):
+            v = col(field)
+            return None if v is None else str(v)
+
+        lat, lng = _num(col("lat")), _num(col("lng"))
+        if (lat is None or lng is None) and coords:
+            lat, lng = nested_coords(row, coords)
 
         yield Business(
             cid=cid,
             name=str(col("name") or "").strip(),
-            category=col("category"),
-            address=col("address"),
-            phone=col("phone"),
-            website=col("website"),
-            booking_url=col("booking_url"),
+            category=text("category"),
+            address=text("address"),
+            phone=text("phone"),
+            website=text("website"),
+            booking_url=text("booking_url"),
             rating=_num(col("rating")),
             review_count=_num(col("review_count"), int),
-            lat=_num(col("lat")),
-            lng=_num(col("lng")),
-            status_raw=col("status_raw"),
+            lat=lat,
+            lng=lng,
+            # A closure flag outranks a status column: it is the more specific
+            # claim, and a "status" column is often something else entirely.
+            status_raw=(closure_status(row, flags) if flags else None)
+            or text("status_raw"),
             source="csv:%s" % profile,
             # str(k) so a ragged row's None key cannot poison the record.
             extras={str(k): v for k, v in row.items() if v not in ("", None)},

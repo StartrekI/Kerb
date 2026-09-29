@@ -56,12 +56,18 @@ class Registered:
     kind: str = "text"                 # categorical | number | boolean | text
     values: Optional[List[Any]] = None
     suggest: Optional[Dict[str, Any]] = None   # a sensible default filter
+    # How a NUMBER ranks, for a builder to weight it: {scale, cap, invert}.
+    # `invert` means lower is better. False means "filter on it, do not rank
+    # by it". The UI used to guess -- a cap of ten times the suggested filter
+    # value, higher always better -- which ranked a 3-branch chain above an
+    # independent and gave every business with a first-review YEAR full marks.
+    rank: Any = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "label": self.label, "cost": self.cost.value,
                 "version": self.version, "description": self.description,
                 "kind": self.kind, "values": self.values,
-                "suggest": self.suggest}
+                "suggest": self.suggest, "rank": self.rank}
 
 
 _REGISTRY: Dict[str, Registered] = {}
@@ -70,7 +76,7 @@ _REGISTRY: Dict[str, Registered] = {}
 def signal(name: str, cost: Cost = Cost.FREE, version: int = 1,
            label: str = "", description: str = "",
            kind: str = "text", values: Optional[List[Any]] = None,
-           suggest: Optional[Dict[str, Any]] = None):
+           suggest: Optional[Dict[str, Any]] = None, rank: Any = None):
     """Decorator registering a signal function."""
     def wrap(fn):
         if name in _REGISTRY:
@@ -79,7 +85,7 @@ def signal(name: str, cost: Cost = Cost.FREE, version: int = 1,
             fn=fn, name=name, cost=cost, version=version,
             label=label or name.replace("_", " ").title(),
             description=description or (fn.__doc__ or "").strip().split("\n")[0],
-            kind=kind, values=values, suggest=suggest,
+            kind=kind, values=values, suggest=suggest, rank=rank,
         )
         return fn
     return wrap

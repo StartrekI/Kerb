@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import unicodedata
+import weakref
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -80,39 +82,52 @@ def match_brand(key: str, known: Dict[str, int]) -> Optional[str]:
     return None
 
 
-_KNOWN_CACHE: Dict[int, Dict[str, int]] = {}
+# Keyed by the Pack object itself, weakly. It was keyed by id() of the LIBRARY,
+# which every typed-trade run clones: the table grew by one entry per run on a
+# long-lived server, and a new clone could inherit a dead one's id -- and with
+# it a table built from a different chains pack.
+_KNOWN_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_KNOWN_LOCK = threading.Lock()
+
+
+def known_chains(pack) -> Dict[str, int]:
+    """Brands from a chains pack, keyed the way names are, or {} without one.
+
+    Cached per pack: this runs once per business, and re-parsing a pack for
+    every row of a 200,000-row file would make a free signal expensive.
+    """
+    if pack is None:
+        return {}
+    with _KNOWN_LOCK:
+        cached = _KNOWN_CACHE.get(pack)
+    if cached is not None:
+        return cached
+    table: Dict[str, int] = {}
+    for entry in pack.get("brands") or []:
+        if isinstance(entry, dict):
+            name, n = entry.get("name", ""), entry.get("locations", 99)
+        else:
+            name, n = str(entry), 99
+        key = chain_key(name)
+        if key:
+            table[key] = int(n)
+    with _KNOWN_LOCK:
+        _KNOWN_CACHE[pack] = table
+    return table
 
 
 def _known_chains(ctx: Context) -> Dict[str, int]:
-    """Brands from the chains pack, keyed the same way names are.
-
-    Cached per library instance: this runs once per business, and re-parsing a
-    pack for every row of a 200,000-row file would make a free signal expensive.
-    """
     seeded = ctx.opt("chain_size", "known")
     if seeded:
         return seeded
-    ident = id(ctx.packs)
-    if ident not in _KNOWN_CACHE:
-        table: Dict[str, int] = {}
-        pack = ctx.packs.maybe("chains/known")
-        if pack:
-            for entry in pack.get("brands") or []:
-                if isinstance(entry, dict):
-                    name, n = entry.get("name", ""), entry.get("locations", 99)
-                else:
-                    name, n = str(entry), 99
-                key = chain_key(name)
-                if key:
-                    table[key] = int(n)
-        _KNOWN_CACHE[ident] = table
-    return _KNOWN_CACHE[ident]
+    return known_chains(ctx.packs.maybe("chains/known"))
 
 
 @signal(name="chain_size", cost=Cost.FREE, version=1,
         label="Chain size",
         description="How many locations of this brand are in the dataset",
-        kind="number", suggest={"op": "<=", "value": 3})
+        kind="number", suggest={"op": "<=", "value": 3},
+        rank={"scale": "log", "cap": 10, "invert": True})
 def chain_size(biz: Business, ctx: Context) -> Signal:
     key = chain_key(biz.name)
     if not key:
@@ -199,7 +214,7 @@ def name_script(biz: Business, ctx: Context) -> Signal:
 @signal(name="review_velocity", cost=Cost.FREE, version=1,
         label="Review velocity",
         description="Reviews per year -- growing, or established and quiet?",
-        kind="number")
+        kind="number", rank={"scale": "log", "cap": 50})
 def review_velocity(biz: Business, ctx: Context) -> Signal:
     count = biz.review_count
     year = biz.first_review_year
@@ -258,7 +273,8 @@ def rating_band(biz: Business, ctx: Context) -> Signal:
         return Signal("rating_band", "unknown", 0.0,
                       {"error": "rating is not a number: %r" % rating})
 
-    ceiling = float(ctx.opt("rating_band", "scale", RATING_MAX) or RATING_MAX)
+    scale = ctx.opt("rating_band", "scale")
+    ceiling = RATING_MAX if scale is None else float(scale)
     if value < 0 or value > ceiling:
         # Refused rather than banded. Silently treating a 10-point rating as a
         # 5-point one would mark every business excellent.
@@ -273,8 +289,9 @@ def rating_band(biz: Business, ctx: Context) -> Signal:
     # collector that simply never supplies the number -- a confident statement
     # about something never measured.
     reviews = biz.review_count
-    floor = int(ctx.opt("rating_band", "min_reviews", RATING_MIN_REVIEWS)
-                or RATING_MIN_REVIEWS)
+    # `min_reviews: 0` is a deliberate "band every rating"; `or` read it as unset.
+    min_reviews = ctx.opt("rating_band", "min_reviews")
+    floor = RATING_MIN_REVIEWS if min_reviews is None else int(min_reviews)
     if reviews is not None and reviews < floor:
         return Signal("rating_band", "unrated", 0.4,
                       {"rating": value, "reviews": reviews, "min_reviews": floor,

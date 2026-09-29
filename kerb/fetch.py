@@ -29,21 +29,23 @@ What it does, and why each one is not optional:
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import threading
 import time
 import urllib.robotparser
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from .collect import RateLimiter
 
-UA = ("kerb/0.1 (+https://github.com/kerb-tool/kerb) "
+UA = ("kerb/0.1 (+https://github.com/StartrekI/Kerb) "
       "local-business research; contact via repository")
 
 DEFAULT_PER_HOST = 0.5          # requests per second, per host
@@ -52,6 +54,12 @@ MAX_REDIRECTS = 5
 CONNECT_TIMEOUT = 10.0
 READ_TIMEOUT = 20.0
 CACHE_TTL = 7 * 24 * 3600
+# How long ANY answer -- a 404, a timeout -- is remembered in memory. The disk
+# cache only keeps successes, so without this the three cheap signals each
+# fetched a dead site again: three requests, and three connect timeouts, for
+# one fact. A minute covers one business's signals and nothing beyond them.
+MEMO_TTL = 60.0
+MEMO_MAX = 2048
 
 
 @dataclass
@@ -67,6 +75,11 @@ class Response:
     elapsed: float = 0.0
     redirected: bool = False
     truncated: bool = False
+    # HTTP requests this answer cost: robots.txt plus every redirect hop, and
+    # 0 when it came from a cache. None means "not reported" -- a fetcher that
+    # is not this one -- which callers must treat as at least one. The request
+    # budget is only a budget if the requests that fetch websites reach it.
+    requests: Optional[int] = None
 
     @property
     def ok(self) -> bool:
@@ -114,7 +127,8 @@ class Fetcher:
                  respect_robots: bool = True,
                  user_agent: str = UA,
                  max_bytes: int = MAX_BYTES,
-                 cache_ttl: float = CACHE_TTL):
+                 cache_ttl: float = CACHE_TTL,
+                 memo_ttl: float = MEMO_TTL):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -123,8 +137,10 @@ class Fetcher:
         self.user_agent = user_agent
         self.max_bytes = max_bytes
         self.cache_ttl = cache_ttl
+        self.memo_ttl = memo_ttl
         self._limiters: Dict[str, RateLimiter] = {}
         self._robots: Dict[str, Any] = {}
+        self._memo: "OrderedDict[str, Tuple[float, Response]]" = OrderedDict()
         self._lock = threading.Lock()
         self.stats = {"requests": 0, "cached": 0, "blocked": 0, "errors": 0}
         self._client = httpx.Client(
@@ -147,17 +163,31 @@ class Fetcher:
                 self._limiters[host] = RateLimiter(per_second=self.per_host)
             return self._limiters[host]
 
-    def allowed(self, url: str) -> bool:
-        """robots.txt, fetched once per host and cached.
+    def _count(self, key: str, n: int = 1) -> None:
+        # Workers share one fetcher; `+=` on a dict entry from several threads
+        # loses increments.
+        with self._lock:
+            self.stats[key] += n
 
-        An unreachable robots.txt is treated as permission (that is what the
-        standard says for 4xx) but a server error is treated as refusal: if the
-        host is having trouble, adding crawl traffic is the wrong response.
+    def allowed(self, url: str) -> bool:
+        """robots.txt, fetched once per host and cached."""
+        return self._allowed(url)[0]
+
+    def _allowed(self, url: str) -> Tuple[bool, int]:
+        """(allowed, requests spent finding out).
+
+        An unavailable robots.txt (4xx) is treated as permission, as RFC 9309
+        says, but a server error is treated as refusal: if the host is having
+        trouble, adding crawl traffic is the wrong response. Redirects are
+        followed -- the RFC asks for at least five, and `http://` to `https://`
+        is how most robots.txt files are reached. Without following them the
+        parser read the redirect's empty body and allowed everything.
         """
         if not self.respect_robots:
-            return True
+            return True, 0
         parts = urlsplit(url)
         host = parts.netloc.lower()
+        spent = 0
         with self._lock:
             cached = self._robots.get(host, "missing")
         if cached == "missing":
@@ -165,11 +195,13 @@ class Fetcher:
             robots_url = "%s://%s/robots.txt" % (parts.scheme, host)
             try:
                 self._limiter(host).acquire()
-                r = self._client.get(robots_url)
+                spent += 1
+                r = self._client.get(robots_url, follow_redirects=True)
+                spent += len(getattr(r, "history", None) or [])
                 if r.status_code >= 500:
                     rp = None                    # refuse while the host is unwell
-                elif r.status_code >= 400:
-                    rp.parse([])                 # no robots.txt = allowed
+                elif r.status_code >= 300:
+                    rp.parse([])                 # no usable robots.txt = allowed
                 else:
                     rp.parse(r.text.splitlines())
             except Exception:                    # noqa: BLE001
@@ -177,15 +209,16 @@ class Fetcher:
             with self._lock:
                 self._robots[host] = rp
             cached = rp
+            self._count("requests", spent)
 
         if cached is None:
-            return False
+            return False, spent
         try:
             ok = cached.can_fetch(self.user_agent, url)
         except Exception:                        # noqa: BLE001
-            return True
+            return True, spent
         if not ok:
-            self.stats["blocked"] += 1
+            self._count("blocked")
         # Honour Crawl-delay if the host asked for one.
         try:
             delay = cached.crawl_delay(self.user_agent)
@@ -195,9 +228,34 @@ class Fetcher:
             lim = self._limiter(host)
             if lim.interval < float(delay):
                 lim.interval = lim.base_interval = float(delay)
-        return ok
+        return ok, spent
 
     # -- cache ------------------------------------------------------------
+
+    def _recall(self, target: str) -> Optional[Response]:
+        """A recent answer for this exact URL, from memory, costing nothing."""
+        if self.memo_ttl <= 0:
+            return None
+        with self._lock:
+            item = self._memo.get(target)
+            if item is None:
+                return None
+            at, resp = item
+            if time.time() - at >= self.memo_ttl:
+                del self._memo[target]
+                return None
+            self._memo.move_to_end(target)
+            self.stats["cached"] += 1
+        return dataclasses.replace(resp, requests=0, from_cache=True, elapsed=0.0)
+
+    def _remember(self, target: str, resp: Response) -> None:
+        if self.memo_ttl <= 0:
+            return
+        with self._lock:
+            self._memo[target] = (time.time(), resp)
+            self._memo.move_to_end(target)
+            while len(self._memo) > MEMO_MAX:
+                self._memo.popitem(last=False)
 
     def _cache_path(self, url: str) -> Optional[Path]:
         if not self.cache_dir:
@@ -229,20 +287,36 @@ class Fetcher:
     # -- the fetch --------------------------------------------------------
 
     def get(self, url: str, force: bool = False) -> Response:
+        """Fetch one URL. Always returns a Response; `requests` says what it cost."""
         started = time.time()
         target = normalise(url)
         if not target:
-            return Response(url=url, error="not an http(s) url")
+            return Response(url=url, error="not an http(s) url", requests=0)
+
+        if not force:
+            recent = self._recall(target)
+            if recent is not None:
+                return recent
 
         entry = None if force else self._cached(target)
         if entry and (time.time() - entry.get("at", 0)) < self.cache_ttl:
-            self.stats["cached"] += 1
-            return Response(url=target, final_url=entry.get("final_url", target),
+            self._count("cached")
+            resp = Response(url=target, final_url=entry.get("final_url", target),
                             status=entry.get("status", 0), text=entry.get("text", ""),
                             headers=entry.get("headers", {}), from_cache=True,
-                            redirected=entry.get("redirected", False))
+                            redirected=entry.get("redirected", False), requests=0)
+        else:
+            spent = [0]
+            resp = self._fetch(target, entry, started, spent)
+            resp.requests = spent[0]
+        self._remember(target, resp)
+        return resp
 
-        if not self.allowed(target):
+    def _fetch(self, target: str, entry: Optional[Dict[str, Any]],
+               started: float, spent: list) -> Response:
+        ok, robots_cost = self._allowed(target)
+        spent[0] += robots_cost
+        if not ok:
             return Response(url=target, error="disallowed by robots.txt")
 
         seen = set()
@@ -256,7 +330,8 @@ class Fetcher:
                 seen.add(current)
                 host = urlsplit(current).netloc.lower()
                 self._limiter(host).acquire()
-                self.stats["requests"] += 1
+                self._count("requests")
+                spent[0] += 1
 
                 headers = {}
                 if entry and entry.get("final_url") == current:
@@ -267,7 +342,7 @@ class Fetcher:
 
                 with self._client.stream("GET", current, headers=headers) as r:
                     if r.status_code == 304 and entry:
-                        self.stats["cached"] += 1
+                        self._count("cached")
                         entry["at"] = time.time()
                         self._store(target, entry)
                         return Response(url=target, final_url=current,
@@ -320,7 +395,7 @@ class Fetcher:
         except Exception as exc:                 # noqa: BLE001
             # Every network failure ends here rather than in a signal. A server
             # that hangs up mid-body must cost this one URL and nothing else.
-            self.stats["errors"] += 1
+            self._count("errors")
             return Response(url=target, final_url=current,
                             error="%s: %s" % (type(exc).__name__, exc),
                             elapsed=time.time() - started)

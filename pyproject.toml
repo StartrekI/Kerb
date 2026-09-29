@@ -30,8 +30,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Only the reviews_live signal needs this, and only on businesses that already
-# passed every cheaper condition. `pip install kerb` stays at two dependencies.
+# Only reviews need this: the reviews_live signal (which runs only on businesses
+# that passed every cheaper condition) and `kerb reviews`. `pip install kerb`
+# stays at two dependencies.
 browser = [
   "selenium>=4.20",
 ]
@@ -51,8 +52,8 @@ dev = [
 kerb = "kerb.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/kerb-tool/kerb"
-Issues = "https://github.com/kerb-tool/kerb/issues"
+Homepage = "https://github.com/StartrekI/Kerb"
+Issues = "https://github.com/StartrekI/Kerb/issues"
 
 [tool.setuptools.packages.find]
 include = ["kerb*"]
