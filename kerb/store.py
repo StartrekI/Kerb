@@ -25,6 +25,8 @@ duplicate anything. That is what makes retries safe enough to be automatic.
 
 from __future__ import annotations
 
+import contextlib
+import gc
 import json
 import os
 import sqlite3
@@ -32,7 +34,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -99,6 +101,29 @@ def default_db() -> Path:
         return Path(override).expanduser()
     return default_dir() / "kerb.db"
 
+
+
+@contextlib.contextmanager
+def _collector_paused() -> Iterator[None]:
+    """Hold the cyclic garbage collector off while decoding many rows.
+
+    Every decoded row is a fresh tree of dicts and lists with no cycles, so a
+    collection can free nothing -- but each one walks everything allocated so
+    far, and a 100,000-row read triggered enough of them to take 12s instead
+    of 3.6s. Only restored if it was on: someone else may have turned it off.
+    """
+    was_on = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_on:
+            gc.enable()
+
+
+def _decode(texts: Any) -> List[Dict[str, Any]]:
+    with _collector_paused():
+        return [json.loads(t) for t in texts]
 
 class Store:
     """One SQLite file. Safe to share across threads; safe to kill at any point."""
@@ -438,7 +463,66 @@ class Store:
             args += [limit, offset]
         with self._lock:
             rows = self.db.execute(sql, args).fetchall()
-        return [json.loads(r["data"]) for r in rows]
+        return _decode(r["data"] for r in rows)
+
+    # What a listing filters and sorts on. Read by SQLite out of the stored
+    # JSON, so a page of 200 from a 100,000-row run decodes 200 rows in Python
+    # rather than all of them -- measured at 17s for the UI's opening request.
+    OUTLINE = ("outcome", "score", "review_count", "name", "category", "address")
+
+    def outline(self, run_id: str) -> Optional[List[Dict[str, Any]]]:
+        """Every row's cid and OUTLINE fields, in the order results() uses.
+
+        None when this SQLite has no JSON functions (built without JSON1, as
+        some older system libraries are); the caller then decodes whole rows.
+        """
+        cols = ", ".join("json_extract(data, '$.%s') AS %s" % (k, k)
+                         for k in self.OUTLINE)
+        try:
+            with self._lock:
+                rows = self.db.execute(
+                    "SELECT cid, %s FROM results WHERE run_id=? ORDER BY cid" % cols,
+                    (run_id,)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such function" in str(exc):
+                return None
+            raise
+        return [dict(r) for r in rows]
+
+    def results_for(self, run_id: str, cids: Sequence[str]) -> List[Dict[str, Any]]:
+        """Whole rows for these cids, in the order given. A cid with no row --
+        removed by a requalify since it was listed -- is left out."""
+        found: Dict[str, str] = {}
+        wanted = list(cids)
+        with self._lock:
+            # Chunked: older SQLite allows 999 bound parameters per statement.
+            for i in range(0, len(wanted), 500):
+                chunk = wanted[i:i + 500]
+                for r in self.db.execute(
+                        "SELECT cid, data FROM results WHERE run_id=? AND cid IN (%s)"
+                        % ",".join("?" * len(chunk)), [run_id, *chunk]):
+                    found[r["cid"]] = r["data"]
+        return _decode(found[c] for c in wanted if c in found)
+
+    def find_result(self, run_id: str, cid: str) -> Optional[Dict[str, Any]]:
+        """One row by cid: exact first, then ignoring case as the API always
+        has. Neither decodes any row but the one returned."""
+        with self._lock:
+            hit = self.db.execute(
+                "SELECT data FROM results WHERE run_id=? AND cid=?",
+                (run_id, cid)).fetchone()
+            if hit is None:
+                want = cid.lower()
+                # str.lower(), not SQL lower(): SQLite folds ASCII only.
+                for r in self.db.execute(
+                        "SELECT cid FROM results WHERE run_id=? ORDER BY cid",
+                        (run_id,)):
+                    if str(r["cid"]).lower() == want:
+                        hit = self.db.execute(
+                            "SELECT data FROM results WHERE run_id=? AND cid=?",
+                            (run_id, r["cid"])).fetchone()
+                        break
+        return json.loads(hit["data"]) if hit is not None else None
 
     def failures(self, run_id: str) -> List[Dict[str, Any]]:
         with self._lock:

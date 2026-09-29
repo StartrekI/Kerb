@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -244,6 +244,27 @@ def stored_summary(run_id: str) -> Optional[Dict[str, Any]]:
 
 def run_data(run_id: str) -> List[Dict[str, Any]]:
     return list(store().results(run_id))
+
+
+def qualified_data(run_id: str) -> List[Dict[str, Any]]:
+    """A run's qualified rows, in ledger order, decoding only those.
+
+    Rescoring and the default export want nothing else, and decoding every row
+    to throw most of them away was most of their time on a large run.
+    """
+    db = store()
+    outline = db.outline(run_id)
+    if outline is None:
+        return [r for r in db.results(run_id)
+                if r.get("outcome") == Outcome.QUALIFIED.value]
+    return db.results_for(run_id, [r["cid"] for r in outline
+                                   if r["outcome"] == Outcome.QUALIFIED.value])
+
+
+# Rows per chunk of a streamed export. Starlette runs each step of a plain
+# generator in its threadpool, and one hop per row cost ~5s on 45,000 rows --
+# more than writing the CSV did.
+EXPORT_CHUNK = 500
 
 
 def _default_columns() -> List[str]:
@@ -761,7 +782,16 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "no run %s" % run_id)
         # Straight from the ledger, so the answer is the same before and after
         # a restart, and the same whether or not this process ran the job.
-        rows = list(store().results(run_id))
+        #
+        # Filtered and sorted on an outline -- the six fields below, read by
+        # SQLite -- and only the page returned is decoded. Decoding every row
+        # to hand back 200 of them took 17s on a 100,000-row run, on the
+        # request the UI makes the moment a run's results open.
+        db = store()
+        rows = db.outline(run_id)
+        whole = rows is None
+        if whole:
+            rows = db.results(run_id)
         if outcome is not None:
             rows = [r for r in rows if r.get("outcome") == outcome]
         elif qualified is not None:
@@ -783,8 +813,14 @@ def create_app() -> FastAPI:
         elif sort == "name":
             rows = sorted(rows, key=lambda r: str(r.get("name") or "").lower())
 
-        return {"total": len(rows), "offset": offset, "limit": limit,
-                "rows": rows[offset:offset + limit]}
+        page = rows[offset:offset + limit]
+        if not whole:
+            page = db.results_for(run_id, [r["cid"] for r in page])
+        # Returned as JSONResponse directly: the rows came out of json.loads,
+        # so FastAPI's jsonable_encoder pass (2.3s for 5,000 rows) could only
+        # hand back the same structure. The bytes on the wire are identical.
+        return JSONResponse({"total": len(rows), "offset": offset,
+                             "limit": limit, "rows": page})
 
     # `:path` because a cid legitimately contains slashes. The overpass source
     # -- the DEFAULT source -- emits `osm:way/456`, and a plain {cid} segment
@@ -794,9 +830,11 @@ def create_app() -> FastAPI:
     def run_business(run_id: str, cid: str):
         if summary_for(run_id) is None:
             raise HTTPException(404, "no run %s" % run_id)
-        for row in store().results(run_id):
-            if str(row.get("cid", "")).lower() == cid.lower():
-                return {**row, "explain": _explain_row(row)}
+        # A keyed lookup. This scanned the whole run, decoding every row, and
+        # took 12s to open one business's evidence on a 100,000-row run.
+        row = store().find_result(run_id, cid)
+        if row is not None:
+            return {**row, "explain": _explain_row(row)}
         raise HTTPException(404, "no business %s in run %s" % (cid, run_id))
 
     @app.post("/api/runs/{run_id}/rescore")
@@ -816,9 +854,8 @@ def create_app() -> FastAPI:
         campaign = _campaign_for(run_id)
         bands = ((campaign.scoring if campaign else {}) or {}).get("bands")
         changed = []
-        for row in store().results(run_id):
-            if row.get("outcome") != Outcome.QUALIFIED.value:
-                continue
+        # Only qualified rows are scored, so only those are decoded.
+        for row in qualified_data(run_id):
             verdict = _verdict_from_row(row)
             scoring.score(verdict, body.weights, body.normalise,
                           confidence=body.confidence)
@@ -947,12 +984,9 @@ def create_app() -> FastAPI:
         from .cli import (_flatten, attributions, csv_safe, render_template,
                           shape_output, template_fields)
 
-        row_data = run_data(run_id)
+        row_data = run_data(run_id) if include_rejected else qualified_data(run_id)
         campaign = _campaign_for(run_id)
         cfg = (campaign.output if campaign else {}) or {}
-        if not include_rejected:
-            row_data = [r for r in row_data
-                        if r.get("outcome") == Outcome.QUALIFIED.value]
         # Best first, as the CLI writes it. The ledger returns rows by cid, and
         # shape_output only sorts when an output block exists -- so a campaign
         # without one exported its leads in id order, not score order.
@@ -977,7 +1011,9 @@ def create_app() -> FastAPI:
                 media_type="application/json", headers=headers)
         if format == "jsonl":
             return StreamingResponse(
-                (json.dumps(r, default=str) + "\n" for r in row_data),
+                ("".join(json.dumps(r, default=str) + "\n"
+                         for r in row_data[i:i + EXPORT_CHUNK])
+                 for i in range(0, len(row_data), EXPORT_CHUNK)),
                 media_type="application/x-ndjson", headers=headers)
 
         template = cfg.get("template")
@@ -994,9 +1030,10 @@ def create_app() -> FastAPI:
             buf = io.StringIO()
             writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
             writer.writeheader()
-            yield buf.getvalue()
-            for record in row_data:
-                buf.seek(0), buf.truncate(0)
+            for n, record in enumerate(row_data, 1):
+                if n % EXPORT_CHUNK == 0:
+                    yield buf.getvalue()
+                    buf.seek(0), buf.truncate(0)
                 if template:
                     flat = render_template(
                         record, _flatten(record, template_fields(template)), template)
@@ -1005,7 +1042,7 @@ def create_app() -> FastAPI:
                     if with_attr:
                         flat["attribution"] = (record.get("extras") or {}).get("attribution")
                 writer.writerow({k: csv_safe(v) for k, v in flat.items()})
-                yield buf.getvalue()
+            yield buf.getvalue()
 
         return StreamingResponse(rows(), media_type="text/csv", headers=headers)
 

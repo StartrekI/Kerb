@@ -126,9 +126,10 @@ def _request(client: httpx.Client, method: str, url: str,
     raise last if last else RuntimeError("unreachable")
 
 
-def geocode(place: str, client: httpx.Client, **retry) -> Optional[Dict[str, float]]:
-    """Place name -> bounding box, via Nominatim."""
-    r = _request(client, "GET", NOMINATIM,
+def geocode(place: str, client: httpx.Client, endpoint: str = NOMINATIM,
+            **retry) -> Optional[Dict[str, float]]:
+    """Place name -> bounding box, via Nominatim or a compatible `endpoint`."""
+    r = _request(client, "GET", endpoint,
                  params={"q": place, "format": "json", "limit": 1},
                  headers={"User-Agent": UA}, timeout=30, **retry)
     hits = r.json()
@@ -182,6 +183,10 @@ def overpass_source(q: SourceQuery) -> Iterator[Business]:
              "backoff": float(q.options.get("backoff", BACKOFF)),
              "tally": q.report}
     endpoint = q.options.get("endpoint", OVERPASS)
+    # Its own option, like `endpoint`: a self-hosted Overpass usually comes
+    # with a self-hosted Nominatim, and without this every place still went
+    # to the public one first.
+    geocoder = q.options.get("geocoder", NOMINATIM)
     per_place = int(q.options.get("per_place", 500))
     emitted = 0
 
@@ -194,7 +199,7 @@ def overpass_source(q: SourceQuery) -> Iterator[Business]:
             # A timeout on the third of fifty towns used to discard the two
             # already collected and the forty-seven not yet tried.
             try:
-                bbox = geocode(place, client, **retry)
+                bbox = geocode(place, client, endpoint=geocoder, **retry)
                 if bbox is None:
                     failed[place] = "could not be geocoded"
                     continue

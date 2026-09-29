@@ -93,18 +93,30 @@ def _scalar(v: Any) -> Any:
     return v
 
 
-def closure_status(row: Dict[str, Any]) -> Optional[str]:
+def closure_keys(headers) -> List[Any]:
+    """The header names that are closure flags. Worked out once per file: the
+    columns do not change between rows, and scanning every column of every row
+    for them cost a measurable share of a 100,000-row import."""
+    return [h for h in headers if str(h).strip().lower() in CLOSURE_FLAGS]
+
+
+def coord_keys(headers) -> List[Any]:
+    return [h for h in headers if str(h).strip().lower() in NESTED_COORDS]
+
+
+def closure_status(row: Dict[str, Any], keys=None) -> Optional[str]:
     """A closure sentence liveness understands, from yes/no columns, or None."""
-    for key, value in row.items():
+    for key in (row if keys is None else keys):
         sentence = CLOSURE_FLAGS.get(str(key).strip().lower())
-        if sentence and _truthy(value):
+        if sentence and _truthy(row.get(key)):
             return sentence
     return None
 
 
-def nested_coords(row: Dict[str, Any]):
+def nested_coords(row: Dict[str, Any], keys=None):
     """(lat, lng) from a nested location mapping, or (None, None)."""
-    for key, value in row.items():
+    for key in (row if keys is None else keys):
+        value = row.get(key)
         if str(key).strip().lower() not in NESTED_COORDS or not isinstance(value, dict):
             continue
         lower = {str(k).lower(): v for k, v in value.items()}
@@ -405,6 +417,7 @@ def csv_source(q: SourceQuery) -> Iterator[Business]:
     headers = [h for h in first.keys() if h is not None and h != EXTRA_KEY]
     mapping = build_mapping(headers, q.options.get("mapping"))
     profile = detect_profile(headers) or "custom"
+    flags, coords = closure_keys(headers), coord_keys(headers)
 
     emitted = 0
     for row in itertools.chain([first], stream):
@@ -421,8 +434,8 @@ def csv_source(q: SourceQuery) -> Iterator[Business]:
             return None if v is None else str(v)
 
         lat, lng = _num(col("lat")), _num(col("lng"))
-        if lat is None or lng is None:
-            lat, lng = nested_coords(row)
+        if (lat is None or lng is None) and coords:
+            lat, lng = nested_coords(row, coords)
 
         yield Business(
             cid=cid,
@@ -438,7 +451,8 @@ def csv_source(q: SourceQuery) -> Iterator[Business]:
             lng=lng,
             # A closure flag outranks a status column: it is the more specific
             # claim, and a "status" column is often something else entirely.
-            status_raw=closure_status(row) or text("status_raw"),
+            status_raw=(closure_status(row, flags) if flags else None)
+            or text("status_raw"),
             source="csv:%s" % profile,
             # str(k) so a ragged row's None key cannot poison the record.
             extras={str(k): v for k, v in row.items() if v not in ("", None)},

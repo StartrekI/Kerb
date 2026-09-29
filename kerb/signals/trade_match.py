@@ -123,6 +123,27 @@ def _match_many(biz: Business, ctx: Context, pack_ids: List[str],
                    "checked": pack_ids, "match": mode})
 
 
+def _rules(ctx: Context, pack):
+    """(vetoes, [(category, lowercased)], name terms) for one trade pack.
+
+    Built once per pack rather than once per business. The veto list compares
+    every shared veto against every term the trade claims, and rebuilding it
+    for each row was a third of the time a 100,000-row import spent -- to
+    reach the same answer 100,000 times. Cached on the pack object and tied to
+    the shared-veto pack it was built against, so a library with a different
+    shared list never reuses it.
+    """
+    shared = ctx.packs.maybe(SHARED_VETOES)
+    cached = pack.__dict__.get("_trade_rules")
+    if cached is not None and cached[0] is shared:
+        return cached[1]
+    rules = (_vetoes(ctx, pack),
+             [(want, want.lower()) for want in pack.list("categories")],
+             _terms(pack))
+    pack.__dict__["_trade_rules"] = (shared, rules)
+    return rules
+
+
 def _match_one(biz: Business, ctx: Context, pack_id: str) -> Signal:
     pack = ctx.packs.maybe(pack_id)
     if pack is None:
@@ -131,17 +152,18 @@ def _match_one(biz: Business, ctx: Context, pack_id: str) -> Signal:
     category = (biz.category or "").strip()
     cat_l = category.lower()
     name_l = (biz.name or "").lower()
+    vetoes, categories, terms = _rules(ctx, pack)
 
     # 1. Veto on category, before anything else.
-    for veto in _vetoes(ctx, pack):
+    for veto in vetoes:
         if veto and veto in cat_l:
             return Signal("trade_match", False, 1.0,
                           {"reason": "vetoed category", "category": category,
                            "matched_veto": veto, "pack": pack.ref})
 
     # 2. Category match -- the trustworthy path.
-    for want in pack.list("categories"):
-        if want.lower() in cat_l and cat_l:
+    for want, want_l in categories:
+        if want_l in cat_l and cat_l:
             return Signal("trade_match", pack.id.split("/")[-1], 0.95,
                           {"matched_category": category, "rule": want,
                            "pack": pack.ref})
@@ -150,7 +172,7 @@ def _match_one(biz: Business, ctx: Context, pack_id: str) -> Signal:
     generic = (not cat_l) or cat_l in {"contractor", "service", "business",
                                        "general contractor", "establishment"}
     if generic:
-        for term in _terms(pack):
+        for term in terms:
             if term and term in name_l:
                 return Signal("trade_match", pack.id.split("/")[-1], 0.6,
                               {"matched_name_term": term, "name": biz.name,

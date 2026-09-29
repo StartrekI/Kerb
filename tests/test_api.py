@@ -272,6 +272,7 @@ def test_source_failure_does_not_lose_the_run(sv):
     # failure is immediate and the test needs no network.
     c["sources"] = [{"id": "overpass",
                      "options": {"endpoint": "http://127.0.0.1:1/interpreter",
+                                 "geocoder": "http://127.0.0.1:1/search",
                                  "retries": 1, "backoff": 0, "pause": 0}}] + c["sources"]
     c["where"] = {"mode": "paste", "places": ["Nowhere-That-Exists-XYZQ"]}
     rid, summary = sv.run_campaign(c, wait=60)
@@ -429,6 +430,10 @@ def test_tasks_endpoint(sv):
 DURABLE = {"name": "durable",
            "sources": [{"id": "overpass",
                         "options": {"endpoint": "http://127.0.0.1:1/x",
+                                    # Or every place geocodes against the
+                                    # public Nominatim first, from a suite
+                                    # that says it runs offline.
+                                    "geocoder": "http://127.0.0.1:1/g",
                                     "retries": 1, "backoff": 0, "pause": 0,
                                     "per_second": 1000}}],
            "where": {"mode": "paste", "places": ["Nowhere-A", "Nowhere-B"]},
@@ -650,6 +655,88 @@ def test_export_is_best_first_without_an_output_block(sv):
     print("  export best first         ok")
 
 
+def test_a_large_export_loses_and_repeats_nothing(sv):
+    """Exports stream in chunks of rows, not a chunk per row. Every row must
+    still arrive exactly once, in order, across the chunk boundaries -- and
+    rejected rows must still be there when asked for."""
+    # Spans several of kerb.api.EXPORT_CHUNK (500) plus a remainder. Not
+    # imported: importing kerb.api builds the app, which confines this whole
+    # process's file reads to the working directory.
+    n = 500 * 2 + 37
+    big = TMP / "big-export.csv"
+    lines = ["title,category,review_count,cid"]
+    for i in range(n):
+        # Every seventh is a cafe, rejected by trade_match.
+        cat = "Cafe" if i % 7 == 0 else "Dentist"
+        lines.append("Practice %d,%s,%d,0xbe:%05d" % (i, cat, 10 + i, i))
+    big.write_text("\n".join(lines) + "\n")
+    rid, s = sv.run_campaign({**campaign_for(big), "scoring": {"weights": {
+        "reviews": {"weight": 100, "scale": "linear", "cap": 5000}}}}, wait=30)
+    qualified = s["qualified"]
+    assert qualified == n - len(range(0, n, 7)), s
+
+    import csv as _csv, io as _io
+    with urllib.request.urlopen(sv.base + "/api/runs/%s/export?format=csv" % rid,
+                                timeout=20) as r:
+        rows = list(_csv.DictReader(_io.StringIO(r.read().decode())))
+    names = [row["name"] for row in rows]
+    assert len(names) == qualified == len(set(names)), (len(names), qualified)
+    scores = [float(row["score"]) for row in rows]
+    assert scores == sorted(scores, reverse=True)
+
+    with urllib.request.urlopen(
+            sv.base + "/api/runs/%s/export?format=jsonl&include_rejected=true" % rid,
+            timeout=20) as r:
+        lines = r.read().decode().splitlines()
+    cids = [json.loads(line)["cid"] for line in lines]
+    assert len(cids) == n == len(set(cids)), (len(cids), n)
+    print("  large export exact        ok")
+
+
+def test_the_listing_answers_as_decoding_every_row_did(sv):
+    """The listing now filters on an outline SQLite reads and decodes only the
+    page. Every combination the UI and API offer must return exactly what
+    decoding every row and filtering in Python returned before."""
+    rid, _ = sv.run_campaign(campaign_for(FIXTURE))
+    from kerb.store import Store
+    db = Store(TMP / "test-runs.db")
+    try:
+        stored = db.results(rid)
+    finally:
+        db.close()
+
+    def old(outcome=None, qualified=None, q=None, sort="score", limit=200, offset=0):
+        rows = list(stored)
+        if outcome is not None:
+            rows = [r for r in rows if r.get("outcome") == outcome]
+        elif qualified is not None:
+            want = "qualified" if qualified else "rejected"
+            rows = [r for r in rows if r.get("outcome") == want]
+        if q:
+            rows = [r for r in rows
+                    if any(q.lower() in str(r.get(k) or "").lower()
+                           for k in ("name", "category", "address"))]
+        key = {"score": lambda r: -(r.get("score") or 0),
+               "reviews": lambda r: -(r.get("review_count") or 0),
+               "name": lambda r: str(r.get("name") or "").lower()}[sort]
+        rows = sorted(rows, key=key)
+        return {"total": len(rows), "offset": offset, "limit": limit,
+                "rows": rows[offset:offset + limit]}
+
+    cases = [{}, {"outcome": "qualified"}, {"outcome": "rejected"},
+             {"outcome": "unevaluated"}, {"qualified": True}, {"qualified": False},
+             {"q": "dent"}, {"q": "LONDON"}, {"sort": "reviews"}, {"sort": "name"},
+             {"sort": "name", "offset": 2, "limit": 3}, {"limit": 0},
+             {"offset": 10000}, {"outcome": "qualified", "sort": "reviews", "limit": 5000}]
+    for params in cases:
+        query = urllib.parse.urlencode({k: str(v).lower() if isinstance(v, bool) else v
+                                        for k, v in params.items()})
+        st, body = sv.get("/api/runs/%s/businesses?%s" % (rid, query))
+        assert st == 200, (params, st, body)
+        assert body == old(**params), "listing changed for %s" % params
+    print("  listing matches decoding  ok")
+
+
 def test_ui_is_self_contained(sv):
     """A strict-CSP-free local page still must not depend on the network."""
     import urllib.request as u
@@ -704,6 +791,8 @@ if __name__ == "__main__":
         test_rescore_moves_the_band_with_the_score(sv)
         test_exports_carry_attribution_and_safe_cells(sv)
         test_export_is_best_first_without_an_output_block(sv)
+        test_the_listing_answers_as_decoding_every_row_did(sv)
+        test_a_large_export_loses_and_repeats_nothing(sv)
         test_ui_is_self_contained(sv)
     test_the_app_confines_reads_however_it_is_started()
     print("\nall api checks passed")

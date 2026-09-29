@@ -578,7 +578,7 @@ trouble renders. Keep these callable with no side effects beyond re-rendering.
 ```bash
 python3 -m kerb serve --port 8811          # then, headless:
 #   /assets/_smoke.html?w=1500&h=1250&theme=dark   → 65 checks, errors=[], DONE=1
-python3 -m pytest tests/ -q                # → 230 passed
+python3 -m pytest tests/ -q                # → 235 passed
 python3 -m kerb stop                       # → clean, nothing left
 ```
 

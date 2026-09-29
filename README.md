@@ -8,7 +8,7 @@ No API key. No browser. No other scraper. And when it can't measure something, i
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-000000.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-230%20passing-2C6A4F.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-235%20passing-2C6A4F.svg)](tests/)
 [![Dependencies](https://img.shields.io/badge/dependencies-2-8A5E23.svg)](pyproject.toml)
 [![Self-hosted](https://img.shields.io/badge/data-never%20leaves%20your%20machine-19C9E6.svg)](#legal)
 
@@ -579,7 +579,7 @@ that is the exact dishonesty this project exists to remove.
 ```bash
 git clone https://github.com/StartrekI/Kerb && cd Kerb
 pip install -e ".[server]"
-python3 -m pytest tests/ -q      # 230 tests, all offline
+python3 -m pytest tests/ -q      # 235 tests, all offline
 ```
 
 Tests are offline by design — one runs against a *real* captured response, trimmed

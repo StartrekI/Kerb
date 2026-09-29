@@ -25,8 +25,8 @@ from ..store import Store
 
 # Overpass and Nominatim are volunteer infrastructure with published etiquette:
 # roughly one request a second, and no parallel hammering. This is a politeness
-# default, not a throughput target -- point `endpoint` at your own instance if
-# you need more.
+# default, not a throughput target -- point `endpoint` (and `geocoder`, for
+# Nominatim) at your own instances if you need more.
 POLITE = {"overpass": 0.5, "nominatim": 1.0}
 DEFAULT_RATE = 1.0
 

@@ -73,6 +73,25 @@ def _signal_failed(verdict: Verdict, path: str) -> bool:
     return bool(s is not None and s.failed)
 
 
+def _signal_unknown(verdict: Verdict, path: str, actual) -> Optional[str]:
+    """Why this value is unknown, if the signal itself says it could not tell.
+
+    A signal that answers None at confidence 0 -- no review count on the
+    record, no dated review to take a year from -- measured correctly and
+    learned nothing. Failing a condition on that nothing used to REJECT the
+    business with "reviews is None, needs >= 30": a verdict about the business
+    built from a measurement that was never taken, which is what the whole
+    three-outcome design exists to prevent. It is not judged instead.
+    """
+    if actual is not None:
+        return None
+    s = verdict.signals.get(path.split(".")[0])
+    if s is None or s.confidence > 0.0:
+        return None
+    note = (s.evidence or {}).get("note") if isinstance(s.evidence, dict) else None
+    return note or "no value to compare"
+
+
 def evaluate(verdict: Verdict, rules: List[Dict[str, Any]],
              available: Optional[set] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """(passed, failing_rule, human_reason). All top-level rules must pass.
@@ -119,6 +138,10 @@ def evaluate(verdict: Verdict, rules: List[Dict[str, Any]],
                 err = (verdict.signals[path.split(".")[0]].evidence or {}).get("error")
                 return False, "unmeasurable:%s" % path, \
                     "%s could not be measured (%s) -- not judged" % (path, err)
+            unknown = _signal_unknown(verdict, path, actual)
+            if unknown:
+                return False, "unmeasurable:%s" % path, \
+                    "%s is unknown (%s) -- not judged" % (path, unknown)
             return False, path, "%s is %r, needs %s %r" % (path, actual, op, want)
     return True, None, None
 

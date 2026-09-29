@@ -247,6 +247,31 @@ def test_a_malformed_campaign_is_explained_not_traced():
     print("  bad YAML explained        ok")
 
 
+def test_a_missing_measurement_is_never_found_out_not_rejected():
+    """Found by running real-shaped data: a business with no review count was
+    REJECTED with "reviews is None, needs >= 30". The README, the gmaps source
+    and the UI all promise "never found out" -- and Google's signed-out view
+    has no counts at all, so this rejected every Maps business."""
+    data = TMP / "nocount.csv"
+    data.write_text("cid,title,category,review_count\n"
+                    "0xe:0x1,Has Count,Dentist,80\n"
+                    "0xe:0x2,No Count,Dentist,\n"
+                    "0xe:0x3,Few Reviews,Dentist,4\n")
+    pipe = Pipeline(Campaign.from_dict({
+        "sources": [{"id": "csv", "options": {"path": str(data)}}],
+        "what": {"packs": ["trades/dentist"]},
+        "filters": [{"signal": "reviews", "op": ">=", "value": 30}]}))
+    got = {v.business.name: v for v in pipe.run()}
+    assert got["Has Count"].outcome is Outcome.QUALIFIED
+    assert got["Few Reviews"].outcome is Outcome.REJECTED, "a real 4 is still a verdict"
+    unknown = got["No Count"]
+    assert unknown.outcome is Outcome.UNEVALUATED, unknown.reject_reason
+    assert "None" not in unknown.reject_reason and "unknown" in unknown.reject_reason
+    assert pipe.stats.rejected == 1 and pipe.stats.unevaluated == 1
+    assert not pipe.breaker.tripped, "an unknown count is not an outage"
+    print("  missing count not judged  ok")
+
+
 # --------------------------------------------------------------- health wiring
 
 def test_discovery_health_is_reported():
@@ -338,6 +363,7 @@ if __name__ == "__main__":
                test_resume_is_case_insensitive_on_cid,
                test_a_checkpoint_resume_measures_the_unevaluated_again,
                test_a_malformed_campaign_is_explained_not_traced,
+               test_a_missing_measurement_is_never_found_out_not_rejected,
                test_discovery_health_is_reported,
                test_breaker_defaults_are_configurable):
         fn()

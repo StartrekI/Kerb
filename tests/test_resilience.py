@@ -219,6 +219,31 @@ def test_attribution_rides_along():
     print("  attribution attached      ok")
 
 
+def test_the_geocoder_can_be_pointed_elsewhere():
+    """`endpoint` moved Overpass to a self-hosted instance, but every place was
+    still geocoded against the public Nominatim first -- including from the
+    test suite, which says it runs offline."""
+    seen = []
+
+    def request(self, method, url, **kw):
+        seen.append((method, str(url)))
+        if method == "GET":
+            return _bbox_hit(kw)
+        return _one_roofer(kw)
+
+    with mock.patch.object(httpx.Client, "request", request), \
+            mock.patch("time.sleep", lambda *a: None):
+        q = SourceQuery(what="roofing", places=["Anywhere"],
+                        options={"endpoint": "http://overpass.internal/api",
+                                 "geocoder": "http://geo.internal/search"})
+        got = list(overpass.overpass_source(q))
+    assert len(got) == 1
+    assert seen == [("GET", "http://geo.internal/search"),
+                    ("POST", "http://overpass.internal/api")], seen
+    assert not any("openstreetmap.org" in url for _, url in seen)
+    print("  geocoder configurable     ok")
+
+
 if __name__ == "__main__":
     print("resilience — one local failure must stay local\n")
     for fn in (test_a_signal_returning_junk_is_contained,
@@ -229,6 +254,7 @@ if __name__ == "__main__":
                test_one_bad_place_does_not_kill_the_others,
                test_rate_limiting_is_retried_not_fatal,
                test_retries_are_finite,
-               test_attribution_rides_along):
+               test_attribution_rides_along,
+               test_the_geocoder_can_be_pointed_elsewhere):
         fn()
     print("\nall resilience checks passed")
