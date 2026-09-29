@@ -377,6 +377,21 @@ def test_split_key_is_filename_safe():
     print("  split key safe           ok")
 
 
+def test_results_are_best_first_with_or_without_the_rejected():
+    """With --include-rejected the file came out in discovery order, qualified
+    and rejected interleaved, so adding the flag reordered the leads."""
+    from kerb.cli import best_first
+    rows = [{"name": "rej", "qualified": False, "score": None},
+            {"name": "low", "qualified": True, "score": 40.0},
+            {"name": "unev", "qualified": False, "score": None},
+            {"name": "zero", "qualified": True, "score": 0.0},
+            {"name": "top", "qualified": True, "score": 92.5}]
+    assert [r["name"] for r in best_first(rows)] == ["top", "low", "zero"]
+    assert [r["name"] for r in best_first(rows, include_rejected=True)] == \
+        ["top", "low", "zero", "rej", "unev"], "qualified first, then as found"
+    print("  best first, rejected last ok")
+
+
 if __name__ == "__main__":
     print("customisation — config that has to actually do something\n")
     for fn in (test_every_listed_trade_pack_is_used,
@@ -399,6 +414,7 @@ if __name__ == "__main__":
                test_output_block_is_not_ignored,
                test_columns_can_name_any_signal,
                test_split_by_writes_one_file_per_group,
-               test_split_key_is_filename_safe):
+               test_split_key_is_filename_safe,
+               test_results_are_best_first_with_or_without_the_rejected):
         fn()
     print("\nall customisation checks passed")

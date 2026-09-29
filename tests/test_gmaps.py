@@ -603,6 +603,23 @@ def test_a_durable_block_halts_and_keeps_the_place():
     print("  durable block halts          ok")
 
 
+def test_what_the_source_cannot_measure_is_really_unmeasured():
+    """The UI warns before a run -- and blocks it -- when a condition names a
+    signal the source cannot supply. That warning is only as good as the
+    declaration, so hold the declaration to what the parsed records give."""
+    from kerb import signals, sources
+    from kerb.campaign import Campaign
+    from kerb.pipeline import Pipeline
+    declared = sources.get("gmaps").cannot_measure
+    assert "reviews" in declared
+    ctx = Pipeline(Campaign.from_dict({"what": {"packs": ["trades/dentist"]}})).ctx
+    for biz in gmaps.parse(FIXTURE, "Islington, London"):
+        for name in declared:
+            got = signals.compute(name, biz, ctx)
+            assert got.value is None and got.confidence == 0.0, (name, got)
+    print("  cannot_measure is honest    ok")
+
+
 if __name__ == "__main__":
     print("gmaps -- the collector Kerb runs itself\n")
     for fn in (test_parses_a_real_response,
@@ -633,6 +650,7 @@ if __name__ == "__main__":
                test_a_layout_change_reaches_the_run,
                test_empty_places_and_notes_reach_the_run,
                test_workers_stop_when_the_run_stops,
-               test_a_durable_block_halts_and_keeps_the_place):
+               test_a_durable_block_halts_and_keeps_the_place,
+               test_what_the_source_cannot_measure_is_really_unmeasured):
         fn()
     print("\nall gmaps checks passed")

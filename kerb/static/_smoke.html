@@ -42,7 +42,18 @@ fr.addEventListener("load", async () => {
   d.getElementById("places").value = "Islington, London";
   d.getElementById("places").dispatchEvent(new w.Event("input", {bubbles:true}));
   await wait(400);
+  // OpenStreetMap carries no reviews and "Review count" is on by default: the
+  // run is held, and says why, until that condition is turned off -- rather
+  // than sending every business to "never found out".
+  L("overpass_reviews_blocksRun", d.getElementById("runBtn").disabled);
+  L("overpass_saysCannotMeasure",
+    /cannot measure/i.test(d.getElementById("problems").textContent));
+  const rv = d.querySelector('[data-on="reviews"]');
+  rv.checked = false; rv.dispatchEvent(new w.Event("input", {bubbles:true}));
+  await wait(400);
   L("overpass_withPlaces_allowsRun", !d.getElementById("runBtn").disabled);
+  rv.checked = true; rv.dispatchEvent(new w.Event("input", {bubbles:true}));
+  await wait(300);
 
   sel.value = "csv"; sel.dispatchEvent(new w.Event("input", {bubbles:true}));
   await wait(300);

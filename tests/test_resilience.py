@@ -244,6 +244,25 @@ def test_the_geocoder_can_be_pointed_elsewhere():
     print("  geocoder configurable     ok")
 
 
+def test_osm_declares_what_it_cannot_measure():
+    """OpenStreetMap carries no reviews. A `reviews` condition -- on by default
+    in the UI -- sent every OSM business to "never found out" with no warning,
+    because the source declared nothing it could not measure."""
+    from kerb import signals
+    from kerb.campaign import Campaign
+    declared = sources.get("overpass").cannot_measure
+    assert {"reviews", "reviews_live"} <= set(declared), declared
+
+    with mock.patch.object(httpx.Client, "request", _fake(_bbox_hit, _one_roofer)), \
+            mock.patch("time.sleep", lambda *a: None):
+        got = list(overpass.overpass_source(SourceQuery(what="roofing", places=["X"])))
+    ctx = Pipeline(Campaign.from_dict({"what": {"packs": ["trades/roofing"]}})).ctx
+    for name in declared:
+        sig = signals.compute(name, got[0], ctx)
+        assert sig.value is None and sig.confidence == 0.0, (name, sig)
+    print("  osm cannot_measure honest ok")
+
+
 if __name__ == "__main__":
     print("resilience — one local failure must stay local\n")
     for fn in (test_a_signal_returning_junk_is_contained,
@@ -255,6 +274,7 @@ if __name__ == "__main__":
                test_rate_limiting_is_retried_not_fatal,
                test_retries_are_finite,
                test_attribution_rides_along,
-               test_the_geocoder_can_be_pointed_elsewhere):
+               test_the_geocoder_can_be_pointed_elsewhere,
+               test_osm_declares_what_it_cannot_measure):
         fn()
     print("\nall resilience checks passed")

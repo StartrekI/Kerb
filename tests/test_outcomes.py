@@ -347,6 +347,36 @@ def test_an_absent_review_count_is_not_zero_reviews():
     print("  absent != zero reviews     ok")
 
 
+def test_exit_codes_say_whether_the_run_is_complete():
+    """A script scheduling `kerb run` reads its exit code. A run cut short by
+    a budget exited 0, exactly like a complete one, so a cron job took a capped
+    run as the whole market."""
+    import yaml
+    from kerb import cli
+    root = Path(__file__).resolve().parent.parent
+    base = yaml.safe_load((root / "examples" / "dentists-from-csv.yaml").read_text())
+    base["sources"][0]["options"]["path"] = str(root / "tests" / "fixtures"
+                                                / "gosom_export.csv")
+
+    def run(campaign):
+        path = TMP / "exit.yaml"
+        path.write_text(yaml.safe_dump(campaign))
+        try:
+            return cli.main(["run", str(path), "--out", str(TMP / "exit.csv"), "-q"])
+        except SystemExit as exc:
+            return exc.code
+
+    assert run(base) == 0, "complete, with results"
+    nothing = {**base, "filters": base["filters"] + [
+        {"signal": "reviews", "op": ">=", "value": 100000}]}
+    assert run(nothing) == 3, "complete, nothing qualified"
+    capped = {**base, "limits": {"max_results": 2}}
+    assert run(capped) == 4, "cut short by a budget is incomplete"
+    broken = {**base, "filters": [{"signal": "reviewz", "op": ">=", "value": 1}]}
+    assert run(broken) == 2, "an invalid campaign never runs"
+    print("  exit codes                ok")
+
+
 if __name__ == "__main__":
     print("outcomes — a failure to measure is not a verdict\n")
     for fn in (
@@ -365,6 +395,7 @@ if __name__ == "__main__":
                test_a_malformed_campaign_is_explained_not_traced,
                test_a_missing_measurement_is_never_found_out_not_rejected,
                test_discovery_health_is_reported,
-               test_breaker_defaults_are_configurable):
+               test_breaker_defaults_are_configurable,
+               test_exit_codes_say_whether_the_run_is_complete):
         fn()
     print("\nall outcome checks passed")
