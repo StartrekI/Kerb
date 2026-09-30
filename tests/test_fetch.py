@@ -28,6 +28,7 @@ from kerb.signals import Context                              # noqa: E402
 TMP = Path(tempfile.mkdtemp(prefix="kerb-fetch-"))
 
 
+
 class FakeNet:
     """A pretend internet. Records every request so politeness is measurable."""
 
@@ -217,8 +218,14 @@ def test_the_cache_stops_a_second_request():
 
 # ------------------------------------------------------------------- signals
 
+# site_contact asks DNS whether an email's domain has a mail server. The suite
+# runs offline, so that answer is "unknown" unless a test supplies one.
+NO_DNS = {"mail_check": lambda domain: None}
+
+
 def sig(name, biz, fetcher):
-    return signals.compute(name, biz, Context(options={name: {"fetcher": fetcher}}))
+    return signals.compute(name, biz, Context(options={name: {"fetcher": fetcher,
+                                                               **NO_DNS}}))
 
 
 def biz(website=None, **kw):
@@ -294,6 +301,82 @@ def test_contact_extraction_skips_toolchain_noise():
     print("  contact extraction        ok")
 
 
+
+def test_a_contact_page_is_read_when_the_home_page_has_none():
+    """Many sites keep the address on a contact or imprint page. One more
+    request -- charged to the budget -- beats reporting no email at all."""
+    home = HTML % ('<a href="/about">About</a> <a href="/contact-us/">Contact</a> '
+                   '<a href="https://www.facebook.com/sharer/sharer.php?u=x">share</a> '
+                   '<a href="https://www.facebook.com/brightsmile">fb</a> '
+                   '<a href="https://instagram.com/brightsmile/">ig</a> '
+                   '<a href="tel:+44 20 7123 4567">call</a> ' + "words " * 50)
+    pages = {"https://c.example/": (200, home, {}),
+             "https://c.example/contact-us/": (200, HTML % "Write to reception@c.example", {})}
+    net = FakeNet(pages=pages)
+    with net.install():
+        f = Fetcher(cache_dir=None, per_host=1000, respect_robots=False)
+        ctx = Context(options={"site_contact": {"fetcher": f,
+                                                "mail_check": lambda d: True}})
+        s = signals.compute("site_contact", biz(website="https://c.example/"), ctx)
+    assert s.value == "reception@c.example", s
+    assert s.evidence["contact_page"] == "https://c.example/contact-us/"
+    assert s.evidence["socials"] == {"facebook": "https://www.facebook.com/brightsmile",
+                                     "instagram": "https://instagram.com/brightsmile/"}
+    assert s.evidence["phones"] == ["+442071234567"]
+    assert s.evidence["mail_server"] is True and s.confidence == 0.9
+    assert net.hits.count("https://c.example/contact-us/") == 1
+    assert ctx.requests == 2, ctx.requests            # home + contact page
+    print("  contact page followed     ok")
+
+
+def test_an_address_that_cannot_receive_mail_is_flagged():
+    net = FakeNet(pages={"https://m.example/": (200, HTML % "mail hi@deadmail.example", {})})
+    with net.install():
+        f = Fetcher(cache_dir=None, per_host=1000, respect_robots=False)
+        asked = []
+        ctx = Context(options={"site_contact": {
+            "fetcher": f, "mail_check": lambda d: asked.append(d) or False}})
+        s = signals.compute("site_contact", biz(website="https://m.example/"), ctx)
+    assert asked == ["deadmail.example"]
+    assert s.value == "hi@deadmail.example" and s.confidence == 0.5
+    assert "bounce" in s.evidence["note"] and s.evidence["mail_server"] is False
+    print("  undeliverable flagged     ok")
+
+
+def test_https_mobile_and_year_are_read_from_one_fetch():
+    modern = ('<html><head><meta name="viewport" content="width=device-width">'
+              '<meta name="generator" content="WordPress 5.2.3"></head><body>'
+              + "Care. " * 50 + '<footer>© 2016–2019 Bright Smile</footer></body></html>')
+    dated = HTML % ("Welcome. " * 50 + "Copyright 2012 Acme Dental Ltd. All rights reserved.")
+    pages = {"https://new.example/": (200, modern, {}),
+             "http://old.example/": (200, dated, {}),
+             "https://bad.example/": (0, httpx.ConnectError(
+                 "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"), {})}
+    net = FakeNet(pages=pages)
+    with net.install():
+        f = Fetcher(cache_dir=None, per_host=1000, respect_robots=False)
+        new = biz(website="https://new.example/")
+        assert sig("site_https", new, f).value is True
+        assert sig("site_mobile", new, f).value is True
+        year = sig("site_year", new, f)
+        assert year.value == 2019 and year.evidence["years_seen"] == [2016, 2019], year
+        assert sig("site_platform", new, f).evidence["generator"] == "WordPress 5.2.3"
+        assert net.hits.count("https://new.example/") == 1, "four signals, one fetch"
+
+        old = biz(website="http://old.example/")
+        https = sig("site_https", old, f)
+        assert https.value is False and "Not secure" in https.evidence["note"]
+        assert sig("site_mobile", old, f).value is False
+        assert sig("site_year", old, f).value == 2012
+
+        bad = sig("site_https", biz(website="https://bad.example/"), f)
+        assert bad.value is False and bad.confidence == 0.8, bad
+
+        none = sig("site_year", biz(), f)
+        assert none.value is None and none.confidence == 1.0
+    print("  https/mobile/year         ok")
+
+
 # --------------------------------------------------------------- the tiering
 
 def test_the_cheap_tier_only_sees_what_survived_free():
@@ -362,8 +445,8 @@ def test_three_cheap_signals_share_one_fetch_even_when_the_site_is_dead():
                          "https://slow.example/": (0, httpx.ConnectTimeout("t"), {})})
     with net.install():
         f = Fetcher(cache_dir=None, per_host=10000, respect_robots=False)
-        ctx_opts = {n: {"fetcher": f} for n in ("site_status", "site_platform",
-                                                "site_contact")}
+        ctx_opts = {n: {"fetcher": f, **NO_DNS} for n in ("site_status", "site_platform",
+                                                          "site_contact")}
         for url in ("https://dead.example/", "https://slow.example/"):
             ctx = Context(options=ctx_opts)
             for n in ("site_status", "site_platform", "site_contact"):
@@ -408,6 +491,9 @@ if __name__ == "__main__":
                test_a_fetch_failure_is_a_failed_measurement_not_a_dead_site,
                test_platform_is_read_from_html_not_the_url,
                test_contact_extraction_skips_toolchain_noise,
+               test_a_contact_page_is_read_when_the_home_page_has_none,
+               test_an_address_that_cannot_receive_mail_is_flagged,
+               test_https_mobile_and_year_are_read_from_one_fetch,
                test_the_cheap_tier_only_sees_what_survived_free,
                test_website_fetches_count_against_the_budget,
                test_three_cheap_signals_share_one_fetch_even_when_the_site_is_dead,

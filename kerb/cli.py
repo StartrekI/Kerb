@@ -1046,7 +1046,8 @@ def cmd_reviews(args) -> int:
 
     out_path = Path(args.out or ("reviews-%s.jsonl" % args.run))
     say(C.bold("harvesting reviews"), C.dim("%d business(es) -> %s" % (len(rows), out_path)))
-    say(C.dim("  one browser; one request captured, then reused for every business"))
+    say(C.dim("  one browser; one request captured, then reused for every business, "
+              "%d at a time" % max(1, min(int(args.workers or 4), 16))))
 
     total, failed = 0, 0
     from .reviews import harvest_many
@@ -1073,7 +1074,8 @@ def cmd_reviews(args) -> int:
                 say(" ", C.good("%-40s" % name), C.dim("%d reviews" % len(revs)))
 
             harvest_many(drv, list(by_cid), first_url,
-                         max_reviews=args.max_reviews, on_business=wrote)
+                         max_reviews=args.max_reviews, on_business=wrote,
+                         concurrency=max(1, min(int(args.workers or 4), 16)))
     except HarvestError as exc:
         say(C.bad("harvest failed:"), str(exc))
         return 1
@@ -1118,8 +1120,8 @@ def cmd_doctor(args) -> int:
 
     say(C.bold("kerb doctor"), C.dim("v" + __version__))
     say("")
-    check("python", sys.version_info >= (3, 9),
-          ".".join(map(str, sys.version_info[:3])) + " (need 3.9+)")
+    check("python", sys.version_info >= (3, 10),
+          ".".join(map(str, sys.version_info[:3])) + " (need 3.10+)")
 
     for mod in ("yaml", "httpx"):
         try:
@@ -1483,6 +1485,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="stop after this many reviews per business")
     rv.add_argument("--all", action="store_true",
                     help="every business in the run, not just the qualified ones")
+    rv.add_argument("--workers", type=int, default=4, metavar="N",
+                    help="businesses harvested in parallel, 1-16 (default 4). "
+                         "More is faster until Google starts refusing; a 429 "
+                         "stops the harvest")
     rv.add_argument("--state-db", metavar="FILE",
                     help="where the ledger lives (default: $KERB_STATE_DB, "
                          "else ~/.kerb/state/kerb.db)")

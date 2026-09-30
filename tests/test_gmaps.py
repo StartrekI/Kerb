@@ -610,7 +610,8 @@ def test_what_the_source_cannot_measure_is_really_unmeasured():
     from kerb import signals, sources
     from kerb.campaign import Campaign
     from kerb.pipeline import Pipeline
-    declared = sources.get("gmaps").cannot_measure
+    _fresh_profile()                  # nothing seen yet: the cautious answer
+    declared = sources.get("gmaps").unmeasurable()
     assert "reviews" in declared
     ctx = Pipeline(Campaign.from_dict({"what": {"packs": ["trades/dentist"]}})).ctx
     for biz in gmaps.parse(FIXTURE, "Islington, London"):
@@ -618,6 +619,198 @@ def test_what_the_source_cannot_measure_is_really_unmeasured():
             got = signals.compute(name, biz, ctx)
             assert got.value is None and got.confidence == 0.0, (name, got)
     print("  cannot_measure is honest    ok")
+
+
+
+# ------------------------------------------------------ the full field set
+
+def full_response(statuses=("Permanently closed", "Temporarily closed",
+                            "Open ⋅ Closes 6 pm", None)):
+    """The real captured response, with the optional fields Google sends under
+    the FULL template added at the positions gosom's production parser reads:
+    count [4][8], price [4][2], status [34][4][4] (or [88][0]), hours
+    [203][0], per-star counts [175][3], description [32][1][1]."""
+    import copy
+    data = gmaps._clean(FIXTURE)
+    data = copy.deepcopy(data)
+    for i, entry in enumerate(data[0][1]):
+        rec = entry[14]
+        rec[4] = [None, None, "££", None, None, None, None, rec[4][7], 140 + i]
+        status = statuses[i % len(statuses)]
+        if status:
+            rec[34] = [None, None, None, None, [None, None, None, None, status]]
+        else:
+            rec[88] = ["Closed ⋅ Opens 9 am Mon"]
+        rec[203] = [[["Monday", 1, None, [["9 am–5 pm"]]],
+                     ["Tuesday", 2, None, [["9 am–1 pm"], ["2–6 pm"]]],
+                     ["Sunday", 7, None, [["Closed"]]]]]
+        rec[175] = [None, None, None, [1, 2, 3, 10, 124 + i]]
+        rec[32] = [None, [None, "Family dental practice"]]
+    return ")]}'\n" + json.dumps(data)
+
+
+def test_the_full_template_brings_counts_status_and_hours():
+    """Under the basic template every record stopped at the rating, so review
+    conditions never worked on Maps -- and "Permanently closed" was never read,
+    so a closed business found on Maps was judged open."""
+    rows = gmaps.parse(full_response(), "Islington")
+    assert [b.review_count for b in rows] == [140, 141, 142, 143]
+    assert [b.status_raw for b in rows] == ["Permanently closed", "Temporarily closed",
+                                            "Open ⋅ Closes 6 pm", "Closed ⋅ Opens 9 am Mon"]
+    assert rows[0].hours == {"Monday": ["9 am–5 pm"], "Tuesday": ["9 am–1 pm", "2–6 pm"],
+                             "Sunday": ["Closed"]}
+    assert rows[0].extras["price_range"] == "££"
+    assert rows[0].extras["reviews_per_rating"] == {"1": 1, "2": 2, "3": 3, "4": 10, "5": 124}
+    assert rows[0].extras["description"] == "Family dental practice"
+    assert rows[0].rating == 4.8
+
+    from kerb import signals
+    from kerb.campaign import Campaign
+    from kerb.pipeline import Pipeline
+    ctx = Pipeline(Campaign.from_dict({"what": {"packs": ["trades/dentist"]}})).ctx
+    got = [signals.compute("liveness", b, ctx).value for b in rows]
+    assert got == ["perm_closed", "temp_closed", "open", "open"], got
+    assert signals.compute("reviews", rows[0], ctx).value == 140
+
+    # The basic template's records are unchanged: no count, no status, no hours.
+    plain = gmaps.parse(FIXTURE, "Islington")[0]
+    assert (plain.review_count, plain.status_raw, plain.hours) == (None, None, None)
+    print("  full fields parsed          ok")
+
+
+def test_closed_businesses_from_maps_are_rejected_end_to_end():
+    from kerb.campaign import Campaign
+    from kerb.pipeline import Pipeline
+    _fresh_profile()
+    httpx.Client = lambda **kw: _REAL_CLIENT(                   # noqa: E731
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, text=full_response())))
+    try:
+        c = Campaign.from_dict({
+            "sources": [{"id": "gmaps", "options": {"pause": 0}}],
+            "where": {"places": ["Islington"]}, "what": {"packs": ["trades/dentist"]},
+            "filters": [{"signal": "liveness", "op": "==", "value": "open"},
+                        {"signal": "reviews", "op": ">=", "value": 30}]})
+        out = {v.business.status_raw: v for v in Pipeline(c).run()}
+    finally:
+        httpx.Client = _REAL_CLIENT
+    assert out["Permanently closed"].outcome.value == "rejected"
+    assert out["Permanently closed"].rejected_by == "liveness"
+    assert out["Temporarily closed"].outcome.value == "rejected"
+    assert out["Open ⋅ Closes 6 pm"].outcome.value == "qualified"
+    print("  closed Maps listings rejected ok")
+
+
+def test_a_refused_full_template_falls_back_to_basic():
+    """If Google answers the full template with a shape Kerb cannot read, the
+    run asks again with the basic one and says so -- rather than stopping."""
+    _fresh_profile()
+    sent = []
+
+    def handler(request):
+        pb = request.url.params.get("pb", "")
+        sent.append("full" if "!12m22" in pb else "basic")
+        if "!12m22" in pb:
+            return httpx.Response(200, text=")]}'\n" + json.dumps([["q", "moved"]]))
+        return httpx.Response(200, text=FIXTURE)
+
+    q = SourceQuery(what="dentist", places=["Islington", "Camden"], options={"pause": 0})
+    rows = drive(q, handler)
+    assert len(rows) == 8, len(rows)
+    assert sent == ["full", "basic", "basic"], sent       # switched once, for everyone
+    assert q.report["requests"] == 3
+    assert any("fell back" in n for n in q.report.get("notes", [])), q.report
+    assert not q.report.get("fatal")
+
+    sent.clear()
+    q = SourceQuery(what="dentist", places=["Islington"],
+                    options={"pause": 0, "fields": "basic"})
+    drive(q, handler)
+    assert sent == ["basic"], "fields: basic must never send the full template"
+    try:
+        drive(SourceQuery(what="d", places=["X"], options={"pause": 0, "fields": "most"}),
+              handler)
+        raise AssertionError("an unknown fields value must be refused")
+    except ValueError:
+        pass
+    print("  full template falls back    ok")
+
+
+def test_what_google_sent_is_remembered_and_steers_the_warning():
+    """The UI blocks a `reviews` condition on Maps only while Google has not been
+    seen sending counts; once a run has seen them, the condition is allowed."""
+    from kerb import sources
+    _fresh_profile()
+    prof = session.Profile({}, TEST_PROFILE)
+    prof.created = 1.0
+    prof.save()
+    assert "reviews" in sources.get("gmaps").unmeasurable()
+
+    drive(SourceQuery(what="dentist", places=["Islington"], options={"pause": 0}),
+          lambda r: httpx.Response(200, text=full_response()))
+    fields = session.Profile.load().fields
+    assert fields == {"review_count": True, "status": True, "hours": True}, fields
+    assert sources.get("gmaps").unmeasurable() == ("review_velocity", "establishment_age")
+    assert "Google returns: review counts yes" in session.Profile.load().describe()
+
+    q = SourceQuery(what="dentist", places=["Islington"], options={"pause": 0})
+    drive(q, lambda r: httpx.Response(200, text=FIXTURE))    # full asked, no counts sent
+    assert session.Profile.load().fields["review_count"] is False
+    assert "reviews" in sources.get("gmaps").unmeasurable()
+    assert any("no review counts" in n for n in q.report.get("notes", [])), q.report
+
+    # A run that chose the basic set says nothing about what Google would send.
+    drive(SourceQuery(what="dentist", places=["Islington"], options={"pause": 0}),
+          lambda r: httpx.Response(200, text=full_response()))
+    drive(SourceQuery(what="dentist", places=["Islington"],
+                      options={"pause": 0, "fields": "basic"}),
+          lambda r: httpx.Response(200, text=FIXTURE))
+    assert session.Profile.load().fields["review_count"] is True
+    print("  fields remembered           ok")
+
+
+def test_setup_check_probes_which_fields_google_sends():
+    _fresh_profile()
+    prof = session.Profile({}, TEST_PROFILE)
+    prof.created = 1.0
+    prof.save()
+
+    def handler(request):
+        if request.url.path == "/search":
+            return httpx.Response(200, text=full_response())
+        return httpx.Response(200, text='<html><a aria-label="Google Account: x">')
+
+    httpx.Client = lambda **kw: _REAL_CLIENT(                   # noqa: E731
+        transport=httpx.MockTransport(handler))
+    try:
+        rep = session.check()
+    finally:
+        httpx.Client = _REAL_CLIENT
+    assert rep["ok"] and rep["signed_in"], rep
+    assert rep["fields"] == {"review_count": True, "status": True, "hours": True}, rep
+    assert "Google returns" in rep["detail"]
+
+    # Google refusing the full set is an answer too: the basic one is what a
+    # run will get, so that is what the check records.
+    asked = []
+
+    def refusing(request):
+        if request.url.path == "/search":
+            pb = request.url.params.get("pb", "")
+            asked.append("full" if "!12m22" in pb else "basic")
+            if "!12m22" in pb:
+                return httpx.Response(200, text=")]}'\n" + json.dumps([["q", "moved"]]))
+            return httpx.Response(200, text=FIXTURE)
+        return httpx.Response(200, text='<html><a aria-label="Google Account: x">')
+
+    httpx.Client = lambda **kw: _REAL_CLIENT(                   # noqa: E731
+        transport=httpx.MockTransport(refusing))
+    try:
+        rep = session.check()
+    finally:
+        httpx.Client = _REAL_CLIENT
+    assert asked == ["full", "basic"], asked
+    assert rep["fields"] == {"review_count": False, "status": False, "hours": False}, rep
+    print("  setup check probes fields   ok")
 
 
 if __name__ == "__main__":
@@ -651,6 +844,11 @@ if __name__ == "__main__":
                test_empty_places_and_notes_reach_the_run,
                test_workers_stop_when_the_run_stops,
                test_a_durable_block_halts_and_keeps_the_place,
-               test_what_the_source_cannot_measure_is_really_unmeasured):
+               test_what_the_source_cannot_measure_is_really_unmeasured,
+               test_the_full_template_brings_counts_status_and_hours,
+               test_closed_businesses_from_maps_are_rejected_end_to_end,
+               test_a_refused_full_template_falls_back_to_basic,
+               test_what_google_sent_is_remembered_and_steers_the_warning,
+               test_setup_check_probes_which_fields_google_sends):
         fn()
     print("\nall gmaps checks passed")

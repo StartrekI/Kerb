@@ -286,21 +286,29 @@ def harvest(driver, url: str, max_reviews: Optional[int] = None,
 
     return rows[:max_reviews] if max_reviews else rows
 
-# Harvest a GROUP of businesses from one captured template, without navigating
-# to any of them. See harvest_many() for why this is the whole optimisation.
-MANY_JS = r"""
+# Harvest MANY businesses from one captured template, without navigating to any
+# of them. See harvest_many() for why this is the whole optimisation.
+#
+# Two scripts. START sets up a worker pool that runs inside the page and
+# returns at once; POLL hands back whatever has finished since the last call.
+# The pool used to run as one long async script per group of eight: every
+# group waited for its slowest business before the next began, and a group
+# longer than Selenium's 120-second client timeout crashed the whole command --
+# one popular business with a few thousand reviews was enough.
+MANY_START_JS = r"""
 const cids = arguments[0], pages = arguments[1], limit = arguments[2];
-const conc = arguments[3], done = arguments[arguments.length - 1];
+const conc = arguments[3];
 const cap = window.__cap;
-if (!cap) { done({error: 'no request captured'}); return; }
+if (!cap) return {error: 'no request captured'};
+if (window.__many && window.__many.running > 0) return {error: 'a harvest is already running'};
 
 const parts = cap.body.split('&');
 let idx = -1, tmpl = null;
 for (let i = 0; i < parts.length; i++)
   if (parts[i].indexOf('f.req=') === 0) { idx = i; tmpl = decodeURIComponent(parts[i].slice(6)); }
-if (idx < 0) { done({error: 'no f.req in captured body'}); return; }
+if (idx < 0) return {error: 'no f.req in captured body'};
 const CID_RE = /0x[0-9a-f]+:0x[0-9a-f]+/i;
-if (!CID_RE.test(tmpl)) { done({error: 'no cid in template'}); return; }
+if (!CID_RE.test(tmpl)) return {error: 'no cid in template'};
 
 function bodyFor(cid, token) {
   let req = tmpl.replace(CID_RE, cid);
@@ -334,24 +342,32 @@ function pick(o, path) {
 function post(cid, token) {
   return new Promise(function (res) {
     const b = bodyFor(cid, token);
-    if (!b) { res(null); return; }
+    if (!b) { res({status: 0, text: null}); return; }
     const x = new XMLHttpRequest();
     x.__replay = true;                      // the recorder must ignore our own
     x.open('POST', cap.url, true);
+    // A page that never answers must cost that business, not hang the pool.
+    x.timeout = 60000;
     for (const k in cap.headers) { try { x.setRequestHeader(k, cap.headers[k]); } catch (e) {} }
-    x.onload  = function () { res(x.status === 200 ? x.responseText : null); };
-    x.onerror = function () { res(null); };
+    x.onload    = function () { res({status: x.status, text: x.status === 200 ? x.responseText : null}); };
+    x.onerror   = function () { res({status: 0, text: null}); };
+    x.ontimeout = function () { res({status: 0, text: null}); };
     x.send(b);
   });
 }
+
+const st = window.__many = {total: cids.length, next: 0, done: 0, pages: 0,
+                            running: 0, ready: [], blocked: false};
 
 async function one(cid) {
   const out = []; const seen = {};
   let token = '', failed = null;
   for (let i = 0; i < pages; i++) {
-    const text = await post(cid, token);
-    if (!text) { failed = 'request failed'; break; }
-    const p = payload(text);
+    const r = await post(cid, token);
+    st.pages++;
+    if (r.status === 429) { st.blocked = true; failed = 'rate limited (429)'; break; }
+    if (!r.text) { failed = 'request failed' + (r.status ? ' (' + r.status + ')' : ''); break; }
+    const p = payload(r.text);
     if (!p) { failed = 'unparseable payload'; break; }
     const items = p[2] || [];
     for (let k = 0; k < items.length; k++) {
@@ -375,29 +391,40 @@ async function one(cid) {
   return {cid: cid, reviews: limit ? out.slice(0, limit) : out, failed: failed};
 }
 
-// A small worker pool. Each business has its OWN cursor, so they are genuinely
-// independent -- but concurrency is capped, because the point is to stop
-// wasting time on page loads, not to flood Google.
-(async function () {
-  const results = [];
-  let next = 0;
-  async function worker() {
-    while (next < cids.length) {
-      const mine = next++;
-      results[mine] = await one(cids[mine]);
+// Each business has its OWN cursor, so they are genuinely independent -- a
+// worker that finishes takes the next business at once, with no batch to
+// wait for. Concurrency is still capped: the point is to stop wasting time on
+// page loads, not to flood Google. A 429 stops every worker taking new work.
+async function worker() {
+  st.running++;
+  try {
+    while (st.next < cids.length && !st.blocked) {
+      const mine = st.next++;
+      let r;
+      try { r = await one(cids[mine]); }
+      catch (e) { r = {cid: cids[mine], reviews: [], failed: 'script error: ' + e}; }
+      st.ready.push(r);
+      st.done++;
     }
-  }
-  const pool = [];
-  for (let i = 0; i < Math.min(conc, cids.length); i++) pool.push(worker());
-  await Promise.all(pool);
-  done({results: results});
-})();
+  } finally { st.running--; }
+}
+const n = Math.min(Math.max(1, conc), cids.length);
+for (let i = 0; i < n; i++) worker();
+return {started: n, total: cids.length};
+"""
+
+MANY_POLL_JS = r"""
+const st = window.__many;
+if (!st) return {error: 'no harvest is running'};
+const out = st.ready.splice(0, st.ready.length);
+return {results: out, done: st.done, total: st.total, pages: st.pages,
+        running: st.running, blocked: st.blocked};
 """
 
 
 def harvest_many(driver, cids, capture_url, max_reviews=None,
-                 pages=500, concurrency=4, group=8,
-                 on_business=None):
+                 pages=500, concurrency=4, group=None,
+                 on_business=None, poll=0.5, stall=180.0):
     """Reviews for MANY businesses from a single captured request.
 
     The optimisation, and why it is worth the extra code: the captured `f.req`
@@ -412,23 +439,35 @@ def harvest_many(driver, cids, capture_url, max_reviews=None,
     Page load, tab click and capture were ~4.4s of fixed cost PER BUSINESS.
     Paying it once instead of a hundred times is where the time goes.
 
-    Each business has its own cursor, so a small in-page worker pool runs
-    several at once. Capped deliberately: the goal is to stop wasting time on
-    page loads, not to flood Google.
+    A pool of `concurrency` workers runs inside the page; each takes the next
+    business the moment it finishes one. Python polls every `poll` seconds
+    and reports each business as it completes, so a crash keeps everything
+    already written. `group` is accepted for compatibility and ignored: there
+    are no groups any more to wait on.
+
+    Raises HarvestError when nothing was captured, when the pages stop
+    advancing for `stall` seconds, or when Google rate-limits the requests --
+    after reporting every business that finished first.
     """
     if not open_reviews(driver, capture_url):
         raise HarvestError(
             "no review request was captured. Usually the signed-out view: it "
             "has no Reviews tab at all. Sign the profile in once with "
             "`kerb setup --import-cookies FILE`.")
-    driver.set_script_timeout(600)
 
-    out = {}
     cids = list(cids)
-    for i in range(0, len(cids), group):
-        chunk = cids[i:i + group]
-        res = driver.execute_async_script(
-            MANY_JS, chunk, pages, max_reviews or 0, concurrency)
+    out: Dict[str, Any] = {}
+    if not cids:
+        return out
+    started = driver.execute_script(MANY_START_JS, cids, pages, max_reviews or 0,
+                                    max(1, int(concurrency)))
+    if not isinstance(started, dict) or started.get("error"):
+        raise HarvestError("review harvest: %s"
+                           % ((started or {}).get("error") or "the pool did not start"))
+
+    last_pages, last_move = -1, time.monotonic()
+    while True:
+        res = driver.execute_script(MANY_POLL_JS) or {}
         if res.get("error"):
             raise HarvestError("review harvest: %s" % res["error"])
         for row in res.get("results") or []:
@@ -437,4 +476,17 @@ def harvest_many(driver, cids, capture_url, max_reviews=None,
             out[row["cid"]] = row
             if on_business:
                 on_business(row["cid"], row.get("reviews") or [], row.get("failed"))
-    return out
+        if res.get("blocked") and not res.get("running"):
+            raise HarvestError(
+                "Google rate-limited the review requests after %d of %d "
+                "business(es); stopped rather than push on. Wait, then re-run "
+                "with fewer --workers." % (res.get("done", 0), len(cids)))
+        if res.get("done", 0) >= res.get("total", len(cids)):
+            return out
+        if res.get("pages", 0) != last_pages:
+            last_pages, last_move = res.get("pages", 0), time.monotonic()
+        elif time.monotonic() - last_move > stall:
+            raise HarvestError(
+                "the review harvest stopped advancing for %ds with %d of %d "
+                "business(es) done" % (stall, res.get("done", 0), len(cids)))
+        time.sleep(poll)

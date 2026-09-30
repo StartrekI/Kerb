@@ -615,7 +615,7 @@ def create_app() -> FastAPI:
         return [{"id": r.id, "label": r.label, "description": r.description,
                  "needs_key": r.needs_key, "needs_browser": r.needs_browser,
                  "legal_note": r.legal_note, "takes": r.takes,
-                 "cannot_measure": list(r.cannot_measure),
+                 "cannot_measure": list(r.unmeasurable()),
                  "instead": r.instead or {},
                  # Whether the key is PRESENT, never the key itself. The UI has
                  # to be able to say "set this up first" without ever holding a

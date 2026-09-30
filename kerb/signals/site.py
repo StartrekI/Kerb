@@ -16,7 +16,17 @@ Three things a listing cannot tell you, and each one changes a verdict:
                  from the URL. A custom domain in front of Wix is still Wix.
                  The URL says `theirsalon.com`; the HTML says Wix.
 
-  site_contact   an email on the page, which is what makes the lead actionable.
+  site_contact   an email on the page, which is what makes the lead actionable
+                 -- read from a contact page when the home page has none, and
+                 checked for a mail server so a bouncing address is flagged.
+
+And three a web agency's pitch is made of, read from the same page at no extra
+request:
+
+  site_https     served securely, or marked "Not secure" by every browser?
+  site_mobile    does it declare a mobile viewport, or shrink a desktop page?
+  site_year      the latest year in its copyright notice -- when it was last
+                 looked after.
 
 The listing-only `web_presence` signal stays exactly as it was. These refine
 it; they do not replace it, because they cost a request and it does not.
@@ -25,8 +35,9 @@ it; they do not replace it, because they cost a request and it does not.
 from __future__ import annotations
 
 import re
+import time
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from ..models import Business, Cost, Signal
 from . import Context, signal
@@ -72,6 +83,36 @@ EMAIL_RE = re.compile(
 EMAIL_NOISE = ("example.com", "sentry.io", "wixpress.com", "godaddy.com",
                "squarespace.com", "@2x", "@sentry", "domain.com", "email.com",
                "yourdomain", "@media", "u003e")
+
+
+HREF_RE = re.compile(r"""href\s*=\s*["']([^"'>\s]+)""", re.I)
+TEL_RE = re.compile(r"""href\s*=\s*["']tel:([^"'>]+)""", re.I)   # spaces allowed
+# Profiles worth recording, by network. Share buttons and tracking pixels live
+# on the same hosts and are not the business's profile, so they are skipped.
+SOCIAL: List[Tuple[str, Tuple[str, ...]]] = [
+    ("facebook",  ("facebook.com/", "fb.com/")),
+    ("instagram", ("instagram.com/",)),
+    ("linkedin",  ("linkedin.com/company/", "linkedin.com/in/")),
+    ("x",         ("twitter.com/", "x.com/")),
+    ("tiktok",    ("tiktok.com/@",)),
+    ("youtube",   ("youtube.com/",)),
+    ("whatsapp",  ("wa.me/", "api.whatsapp.com/send")),
+]
+SOCIAL_NOISE = ("sharer", "/share", "intent/", "/plugins/", "/tr?", "/dialog/",
+                "/embed/", "/watch?", "/hashtag/", "/policies")
+# Pages that usually carry the address when the home page does not. An imprint
+# (Impressum) is legally required to in much of Europe.
+CONTACT_WORDS = ("contact", "kontakt", "contacto", "contatti", "contactez",
+                 "get-in-touch", "impressum", "imprint", "about")
+VIEWPORT_RE = re.compile(r"""<meta[^>]+name\s*=\s*["']?viewport""", re.I)
+COPYRIGHT_RE = re.compile(
+    r"(?:©|&copy;|&#169;|&#xa9;|copyright)[^<\d]{0,60}((?:19|20)\d{2})"
+    r"(?:\s*[-–—/]\s*((?:19|20)\d{2}))?", re.I)
+GENERATOR_RE = (
+    re.compile(r"""<meta[^>]+name\s*=\s*["']generator["'][^>]*content\s*=\s*["']([^"']+)""", re.I),
+    re.compile(r"""<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]*name\s*=\s*["']generator""", re.I),
+)
+THIS_YEAR = time.gmtime().tm_year
 
 
 def _target(biz: Business) -> str:
@@ -208,19 +249,85 @@ def site_platform(biz: Business, ctx: Context) -> Signal:
 
     hay = (resp.text[:200_000] + " " + " ".join(
         "%s: %s" % kv for kv in resp.headers.items())).lower()
+    # What the page says it was made with -- "WordPress 5.2.3" is a version
+    # three years out of date, which is a sentence in a pitch.
+    generator = None
+    for rx in GENERATOR_RE:
+        m = rx.search(resp.text[:200_000])
+        if m:
+            generator = m.group(1).strip()[:80]
+            break
+    extra = {"generator": generator} if generator else {}
     for name, markers in PLATFORM_MARKERS:
         for marker in markers:
             if marker.lower() in hay:
                 return Signal("site_platform", name, 0.9,
-                              {"matched": marker, "final_url": resp.final_url,
-                               "note": "read from what the site served, so a "
-                                       "custom domain does not hide it"})
+                              dict({"matched": marker, "final_url": resp.final_url,
+                                    "note": "read from what the site served, so a "
+                                            "custom domain does not hide it"}, **extra))
     return Signal("site_platform", "custom", 0.6,
-                  {"final_url": resp.final_url,
-                   "note": "no known builder markers found"})
+                  dict({"final_url": resp.final_url,
+                        "note": "no known builder markers found"}, **extra))
 
 
-@signal(name="site_contact", cost=Cost.CHEAP, version=1,
+def _emails(text: str) -> List[str]:
+    found: List[str] = []
+    for match in EMAIL_RE.finditer(text[:200_000]):
+        email = match.group(0).strip(".").lower()
+        if any(n in email for n in EMAIL_NOISE):
+            continue
+        if email not in found:
+            found.append(email)
+        if len(found) >= 5:
+            break
+    return found
+
+
+def _socials(text: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for href in HREF_RE.findall(text[:200_000]):
+        low = href.lower()
+        if not low.startswith(("http://", "https://", "//")):
+            continue
+        if any(n in low for n in SOCIAL_NOISE):
+            continue
+        for network, markers in SOCIAL:
+            if network not in out and any(m in low for m in markers):
+                out[network] = href
+                break
+    return out
+
+
+def _phones(text: str) -> List[str]:
+    out: List[str] = []
+    for raw in TEL_RE.findall(text[:200_000]):
+        number = re.sub(r"[^\d+]", "", raw)
+        if len(number) >= 6 and number not in out:
+            out.append(number)
+    return out[:3]
+
+
+def _contact_page(text: str, base: str) -> Optional[str]:
+    """The site's own contact (or imprint, or about) page, if it links one.
+    Contact wording first, imprint next, about last."""
+    host = urlsplit(base).netloc.lower().removeprefix("www.")
+    best: Optional[Tuple[int, str]] = None
+    for href in HREF_RE.findall(text[:200_000]):
+        url = urljoin(base, href)
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https"):
+            continue
+        if parts.netloc.lower().removeprefix("www.") != host:
+            continue
+        path = parts.path.lower()
+        for rank, word in enumerate(CONTACT_WORDS):
+            if word in path and (best is None or rank < best[0]):
+                best = (rank, url.split("#")[0])
+                break
+    return best[1] if best else None
+
+
+@signal(name="site_contact", cost=Cost.CHEAP, version=2,
         label="Contact on site",
         description="An email address published on the business's own site",
         kind="text")
@@ -235,17 +342,113 @@ def site_contact(biz: Business, ctx: Context) -> Signal:
     if not resp.ok:
         return Signal("site_contact", None, 0.5, {"status": resp.status})
 
-    found: List[str] = []
-    for match in EMAIL_RE.finditer(resp.text[:200_000]):
-        email = match.group(0).strip(".").lower()
-        if any(n in email for n in EMAIL_NOISE):
-            continue
-        if email not in found:
-            found.append(email)
-        if len(found) >= 5:
-            break
+    ev: Dict[str, object] = {"final_url": resp.final_url}
+    found = _emails(resp.text)
+    socials, phones = _socials(resp.text), _phones(resp.text)
+
+    # Many sites keep the address on a contact or imprint page. One more
+    # request -- only when the home page had none, and charged to the budget.
+    if not found:
+        page = _contact_page(resp.text, resp.final_url or url)
+        if page and page.rstrip("/") != (resp.final_url or url).rstrip("/"):
+            sub = _get(ctx, "site_contact", page)
+            if sub.ok:
+                ev["contact_page"] = page
+                found = _emails(sub.text)
+                for network, link in _socials(sub.text).items():
+                    socials.setdefault(network, link)
+                phones += [n for n in _phones(sub.text) if n not in phones]
+    if socials:
+        ev["socials"] = socials
+    if phones:
+        ev["phones"] = phones[:3]
     if not found:
         return Signal("site_contact", None, 0.9,
-                      {"note": "no address published on the page fetched"})
-    return Signal("site_contact", found[0], 0.9,
-                  {"emails": found, "final_url": resp.final_url})
+                      dict(ev, note="no address published on the home page"
+                                    + (" or its contact page" if "contact_page" in ev else "")))
+
+    ev["emails"] = found
+    check = ctx.opt("site_contact", "mail_check")
+    if check is None:
+        from ..dns import has_mail as check
+    mail = check(found[0].rsplit("@", 1)[-1])
+    ev["mail_server"] = mail
+    if mail is False:
+        return Signal("site_contact", found[0], 0.5,
+                      dict(ev, note="the address's domain has no mail server -- "
+                                    "mail to it will bounce"))
+    return Signal("site_contact", found[0], 0.9, ev)
+
+
+def _page(ctx: Context, name: str, biz: Business):
+    """The business's page for a read-only check, or the Signal to return
+    instead when there is none to read."""
+    url = _target(biz)
+    if not url:
+        return None, Signal(name, None, 1.0, {"note": "no website to check"})
+    resp = _get(ctx, name, url)
+    if resp.error:
+        return resp, Signal(name, None, 0.0, {"error": resp.error, "url": url})
+    if not resp.ok:
+        return resp, Signal(name, None, 0.5,
+                            {"status": resp.status, "note": "nothing served to inspect"})
+    return resp, None
+
+
+@signal(name="site_https", cost=Cost.CHEAP, version=1,
+        label="Secure website (HTTPS)",
+        description="Does the site end up on HTTPS? Browsers mark the rest 'Not secure'",
+        kind="boolean", suggest={"op": "==", "value": False})
+def site_https(biz: Business, ctx: Context) -> Signal:
+    resp, early = _page(ctx, "site_https", biz)
+    if early is not None:
+        err = (resp.error or "").lower() if resp is not None else ""
+        if "certificate" in err or "ssl" in err:
+            # The site answered and its certificate did not check out: that
+            # is a finding about the site, not a failed measurement.
+            return Signal("site_https", False, 0.8,
+                          {"error": resp.error, "note": "the certificate did not verify"})
+        return early
+    final = resp.final_url or _target(biz)
+    secure = urlsplit(final).scheme == "https"
+    ev = {"final_url": final}
+    if not secure:
+        ev["note"] = "served over plain HTTP -- browsers show 'Not secure'"
+    return Signal("site_https", secure, 1.0, ev)
+
+
+@signal(name="site_mobile", cost=Cost.CHEAP, version=1,
+        label="Mobile-friendly site",
+        description="Does the page declare a mobile viewport, or shrink a desktop page?",
+        kind="boolean", suggest={"op": "==", "value": False})
+def site_mobile(biz: Business, ctx: Context) -> Signal:
+    resp, early = _page(ctx, "site_mobile", biz)
+    if early is not None:
+        return early
+    ok = bool(VIEWPORT_RE.search(resp.text[:200_000]))
+    return Signal("site_mobile", ok, 0.85,
+                  {"final_url": resp.final_url,
+                   "note": "declares a mobile viewport" if ok else
+                           "no viewport tag -- phones get a shrunken desktop page"})
+
+
+@signal(name="site_year", cost=Cost.CHEAP, version=1,
+        label="Site copyright year",
+        description="The latest year in the site's copyright notice -- when it was last looked after",
+        kind="number", rank=False,
+        suggest={"op": "<=", "value": THIS_YEAR - 3})
+def site_year(biz: Business, ctx: Context) -> Signal:
+    resp, early = _page(ctx, "site_year", biz)
+    if early is not None:
+        return early
+    years = []
+    for m in COPYRIGHT_RE.finditer(resp.text[:300_000]):
+        for g in m.groups():
+            if g and 1995 <= int(g) <= THIS_YEAR:
+                years.append(int(g))
+    if not years:
+        return Signal("site_year", None, 0.6,
+                      {"final_url": resp.final_url,
+                       "note": "no copyright year on the page"})
+    return Signal("site_year", max(years), 0.8,
+                  {"final_url": resp.final_url, "years_seen": sorted(set(years))[-4:]})

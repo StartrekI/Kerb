@@ -153,29 +153,90 @@ def test_progress_is_reported_as_it_goes():
     print("  progress reported            ok")
 
 
-def test_harvest_many_batches_and_reports_each_business():
-    """The optimisation: one capture, then every business by swapping the cid
-    in the template. Measured 7.4s -> 1.28s per business, same reviews."""
-    from kerb.reviews import harvest_many
+class PoolDriver(FakeDriver):
+    """Stands in for the in-page worker pool: START records what it was given,
+    each POLL releases up to `per_poll` finished businesses."""
 
-    class ManyDriver(FakeDriver):
-        def __init__(self):
-            super().__init__([], captured=True)
-            self.groups = []
-        def execute_async_script(self, js, cids, pages, limit, conc):
-            self.groups.append(list(cids))
+    def __init__(self, per_poll=3, block_after=None, stall=False):
+        super().__init__([], captured=True)
+        self.per_poll, self.block_after, self.stall = per_poll, block_after, stall
+        self.starts, self.polls = [], 0
+
+    def execute_script(self, js, *a):
+        if "window.__many = {" in js:
+            self.starts.append(a)
+            self.todo, self.done, self.pages = list(a[0]), 0, 0
+            return {"started": min(a[3], len(a[0])), "total": len(a[0])}
+        if "st.ready.splice" in js:
+            self.polls += 1
+            if self.stall:
+                return {"results": [], "done": 0, "total": len(self.todo), "pages": 0,
+                        "running": 1, "blocked": False}
+            n = self.per_poll
+            if self.block_after is not None:
+                n = max(0, min(n, self.block_after - self.done))
+            batch, self.todo = self.todo[:n], self.todo[n:]
+            self.done += len(batch)
+            self.pages += 2 * len(batch)
+            blocked = self.block_after is not None and self.done >= self.block_after
             return {"results": [{"cid": c, "reviews": [rev(i) for i in range(3)],
-                                 "failed": None} for c in cids]}
+                                 "failed": None} for c in batch],
+                    "done": self.done, "total": self.done + len(self.todo) if not blocked
+                    else self.done + len(self.todo), "pages": self.pages,
+                    "running": 0 if blocked or not self.todo else 1, "blocked": blocked}
+        return super().execute_script(js, *a)
 
-    d = ManyDriver()
+
+def test_harvest_many_reports_each_business_as_it_finishes():
+    """The optimisation: one capture, then every business by swapping the cid
+    in the template -- measured 7.4s -> 1.28s per business. Now also one pool
+    with no batches: every business goes in at once, and each is reported the
+    moment it finishes rather than when its group of eight did."""
+    from kerb.reviews import harvest_many
+    d = PoolDriver(per_poll=3)
     seen = []
     cids = ["0x1:0x%d" % i for i in range(20)]
-    out = harvest_many(d, cids, "https://maps/x", group=8,
+    out = harvest_many(d, cids, "https://maps/x", concurrency=8, poll=0,
                        on_business=lambda c, r, f: seen.append((c, len(r))))
-    assert len(out) == 20, len(out)
-    assert [len(g) for g in d.groups] == [8, 8, 4], d.groups
-    assert len(seen) == 20 and seen[0][1] == 3
-    print("  many: batches + reports      ok")
+    assert len(out) == 20 and len(seen) == 20 and seen[0][1] == 3
+    assert len(d.starts) == 1, "one pool for every business, not one per group"
+    assert d.starts[0][0] == cids and d.starts[0][3] == 8, d.starts
+    assert d.polls == 7, d.polls                   # 3 at a time -> incremental
+    print("  many: one pool, reports as done ok")
+
+
+def test_a_rate_limit_stops_the_pool_after_saving_what_finished():
+    from kerb.reviews import harvest_many
+    d = PoolDriver(per_poll=4, block_after=6)
+    seen = []
+    try:
+        harvest_many(d, ["0x1:0x%d" % i for i in range(20)], "u", poll=0,
+                     on_business=lambda c, r, f: seen.append(c))
+    except HarvestError as exc:
+        assert "rate-limited" in str(exc) and "6 of 20" in str(exc), str(exc)
+        assert len(seen) == 6, "every finished business is reported before stopping"
+        print("  many: 429 stops, keeps done  ok")
+        return
+    raise AssertionError("a rate limit must stop the harvest and say so")
+
+
+def test_a_stalled_harvest_raises_instead_of_hanging():
+    from kerb.reviews import harvest_many
+    d = PoolDriver(stall=True)
+    try:
+        harvest_many(d, ["0x1:0x1", "0x1:0x2"], "u", poll=0.01, stall=0.05)
+    except HarvestError as exc:
+        assert "stopped advancing" in str(exc), str(exc)
+        print("  many: stall raises           ok")
+        return
+    raise AssertionError("a harvest whose pages stop advancing must not hang")
+
+
+def test_the_reviews_command_takes_a_worker_count():
+    from kerb.cli import build_parser
+    assert build_parser().parse_args(["reviews", "abc"]).workers == 4
+    assert build_parser().parse_args(["reviews", "abc", "--workers", "8"]).workers == 8
+    print("  --workers flag               ok")
 
 
 def test_harvest_many_without_a_capture_names_the_cause():
@@ -200,7 +261,10 @@ if __name__ == "__main__":
                test_max_reviews_is_respected,
                test_a_chain_error_raises_rather_than_returning_short,
                test_progress_is_reported_as_it_goes,
-               test_harvest_many_batches_and_reports_each_business,
+               test_harvest_many_reports_each_business_as_it_finishes,
+               test_a_rate_limit_stops_the_pool_after_saving_what_finished,
+               test_a_stalled_harvest_raises_instead_of_hanging,
+               test_the_reviews_command_takes_a_worker_count,
                test_harvest_many_without_a_capture_names_the_cause):
         fn()
     print("\nall review checks passed")

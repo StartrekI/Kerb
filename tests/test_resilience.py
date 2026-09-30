@@ -250,7 +250,7 @@ def test_osm_declares_what_it_cannot_measure():
     because the source declared nothing it could not measure."""
     from kerb import signals
     from kerb.campaign import Campaign
-    declared = sources.get("overpass").cannot_measure
+    declared = sources.get("overpass").unmeasurable()
     assert {"reviews", "reviews_live"} <= set(declared), declared
 
     with mock.patch.object(httpx.Client, "request", _fake(_bbox_hit, _one_roofer)), \
