@@ -1,0 +1,32 @@
+name: tests
+
+# The whole suite is offline by design, so CI needs no secrets and no network
+# beyond installing the package.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: pip install -e ".[server,dev]"
+      - name: Test
+        run: python -m pytest -q
+      - name: Doctor
+        run: kerb doctor

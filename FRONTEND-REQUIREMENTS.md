@@ -204,7 +204,7 @@ All endpoints are same-origin. `GET` unless noted.
 ### 4.1 Boot (call all four in parallel on load)
 
 ```
-GET /api/health   → {"status":"ok","version":"0.1.0","signals":15,"sources":3,"packs":14}
+GET /api/health   → {"status":"ok","version":"0.1.0","signals":18,"sources":3,"packs":14}
 GET /api/signals  → [Signal]   (see table below)
 GET /api/sources  → [Source]
 GET /api/packs    → [Pack]
@@ -248,6 +248,9 @@ behind the registry, so the UI could not express things the config file could.
 | `site_status` | Website status | categorical | **cheap** | live, dead, parked, placeholder, no_site, unknown | `in [dead, parked, placeholder, no_site]` |
 | `site_platform` | Site platform | categorical | **cheap** | wix, squarespace, shopify, wordpress, godaddy, weebly, webflow, duda, square, facebook, custom, unknown | — |
 | `site_contact` | Contact on site | text | **cheap** | — | — |
+| `site_https` | Secure website (HTTPS) | boolean | **cheap** | — | `== false` |
+| `site_mobile` | Mobile-friendly site | boolean | **cheap** | — | `== false` |
+| `site_year` | Site copyright year | number | **cheap** | — | `<= (this year − 3)` (a year: `rank: false`) |
 | `reviews_live` | Review count (fetched) | number | **expensive** | — | — |
 
 Render `categorical` as multi-select chips when the operator is `in`, a dropdown
@@ -578,7 +581,7 @@ trouble renders. Keep these callable with no side effects beyond re-rendering.
 ```bash
 python3 -m kerb serve --port 8811          # then, headless:
 #   /assets/_smoke.html?w=1500&h=1250&theme=dark   → 67 checks, errors=[], DONE=1
-python3 -m pytest tests/ -q                # → 244 passed
+python3 -m pytest tests/ -q                # → 258 passed
 python3 -m kerb stop                       # → clean, nothing left
 ```
 

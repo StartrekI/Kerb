@@ -77,6 +77,14 @@ class Profile:
         # between a full listing and a partial one -- and the user has to be
         # told which one they are getting.
         self.signed_in: bool = bool(d.get("signed_in") or False)
+        # Which optional fields Google has been SEEN to return to this profile
+        # -- review counts, closure status, opening hours -- and when. Recorded
+        # by `kerb setup` and by every Google Maps run, because what the
+        # endpoint sends is Google's choice, not Kerb's, and the UI should warn
+        # about what is really missing rather than about a fixed assumption.
+        self.fields: Dict[str, bool] = {k: bool(v) for k, v in
+                                        dict(d.get("fields") or {}).items()}
+        self.fields_at: float = float(d.get("fields_at") or 0.0)
 
     # -- persistence ------------------------------------------------------
 
@@ -96,7 +104,8 @@ class Profile:
                 "cookies": self.cookies, "created": self.created or time.time(),
                 "checked": self.checked, "blocked_at": self.blocked_at,
                 "cooldown_until": self.cooldown_until, "blocks": self.blocks,
-                "signed_in": self.signed_in}
+                "signed_in": self.signed_in, "fields": self.fields,
+                "fields_at": self.fields_at}
         # A temp name UNIQUE to this writer. Every thread previously wrote to
         # the same `.tmp` and then renamed it, so with parallel workers the
         # first rename moved the file out from under the second and it died
@@ -167,11 +176,27 @@ class Profile:
         base += ("\n         signed in to Google: %s"
                  % ("yes" if self.signed_in
                     else "NO -- Google serves a reduced view of Maps"))
+        if self.fields:
+            names = {"review_count": "review counts", "status": "closure status",
+                     "hours": "opening hours"}
+            base += ("\n         Google returns: %s (seen %s ago)"
+                     % (", ".join("%s %s" % (label, "yes" if self.fields.get(k) else "NO")
+                                  for k, label in names.items()),
+                        _ago(time.time() - self.fields_at)))
         cool = self.cooling()
         if cool:
             base += ("\n         COOLING DOWN for another %s after %d block(s)"
                      % (_ago(cool), self.blocks))
         return base
+
+    def record_fields(self, seen: Dict[str, int], records: int) -> None:
+        """Remember which optional fields a batch of Google records carried.
+        Nothing is recorded from zero records: an empty answer says nothing
+        about what Google would send."""
+        if records <= 0:
+            return
+        self.fields = {k: bool(seen.get(k)) for k in ("review_count", "status", "hours")}
+        self.fields_at = time.time()
 
 
 def _ago(sec: float) -> str:
@@ -293,10 +318,20 @@ def setup(hl: str = "en", gl: str = "us", timeout: float = 25.0,
                 "from the same network, or by choosing a different --gl region.")
 
         prof.signed_in = looks_signed_in(r.text)
+        _probe(prof, client)
 
     prof.checked = time.time()
     prof.save()
     return prof
+
+
+def _probe(prof: "Profile", client) -> None:
+    """One real Maps search, to learn which optional fields Google sends this
+    profile. A probe that cannot be read leaves what is known unchanged."""
+    from .sources.gmaps import probe_fields     # gmaps imports this module
+    got = probe_fields(client, prof.locale.get("hl", "en"), prof.locale.get("gl", "us"))
+    if got:
+        prof.record_fields(got, got["records"])
 
 
 def _is_consent(url: str, body: str) -> bool:
@@ -329,8 +364,13 @@ def check(prof: Optional[Profile] = None, timeout: float = 25.0) -> Dict[str, An
         else:
             out["ok"] = True
             prof.signed_in = looks_signed_in(r.text)
+            with httpx.Client(follow_redirects=True, timeout=timeout,
+                              headers=prof.headers(), cookies=prof.cookies) as client:
+                _probe(prof, client)
             prof.save()
         out["signed_in"] = prof.signed_in
+        out["fields"] = dict(prof.fields)
+        out["detail"] = prof.describe()
     except httpx.HTTPError as exc:
         out["problem"] = "could not reach google.com: %s" % exc
     return out

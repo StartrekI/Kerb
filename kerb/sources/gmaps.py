@@ -77,13 +77,34 @@ FIELDS = {
     "hours":     203,
 }
 RATING_AT = 7              # index inside FIELDS["rating"]
+COUNT_AT = 8               # ... and the review count beside it, when sent
 
 # The request template. Everything Google returns is decided by `pb`, so it is
 # exposed as an option: a future field can be enabled without editing code.
 #   1d = viewport metres, 2d/3d = lng/lat, 7i = page size, 8i = offset
-PB_TEMPLATE = ("!4m12!1m3!1d{span}!2d{lng}!3d{lat}!2m3!1f0!2f0!3f0"
-               "!3m2!1i1024!2i768!4f13.1!7i{take}!8i{skip}!10b1"
-               "!12m3!1e3!2b1!3e2!2b1!4b1!9b0")
+#
+# BASIC is the template Kerb shipped with. It is verified against a live
+# response, and each record it returns stops at the rating: no review count,
+# no closure status, no opening hours.
+PB_BASIC = ("!4m12!1m3!1d{span}!2d{lng}!3d{lat}!2m3!1f0!2f0!3f0"
+            "!3m2!1i1024!2i768!4f13.1!7i{take}!8i{skip}!10b1"
+            "!12m3!1e3!2b1!3e2!2b1!4b1!9b0")
+# FULL is the same request with the field section the Maps site itself sends --
+# the one gosom/google-maps-scraper's HTTP "fast mode" uses in production, whose
+# parser reads the review count at [4][8], the status at [34][4][4] and the
+# hours at [203][0]. A run tries it first and falls back to BASIC on its own if
+# Google answers it with a shape Kerb cannot read.
+PB_FULL = ("!4m12!1m3!1d{span}!2d{lng}!3d{lat}!2m3!1f0!2f0!3f0"
+           "!3m2!1i1024!2i768!4f13.1!7i{take}!8i{skip}!10b1"
+           "!12m22!1m3!18b1!30b1!34e1!2m3!5m1!6e2!20e3!4b0!10b1!12b1!13b1"
+           "!16b1!17m1!3e1!20m3!5e2!6b1!14b1!46m1!1b0!96b1"
+           "!19m4!2m3!1i360!2i120!4i8")
+PB_TEMPLATE = PB_FULL
+TEMPLATES = {"full": PB_FULL, "basic": PB_BASIC}
+
+# The optional fields worth knowing whether Google sent. What the profile
+# remembers, and what `kerb setup --check` reports.
+OPTIONAL_FIELDS = ("review_count", "status", "hours")
 
 # A neutral point. Only the text query decides which businesses come back, so
 # this is a placeholder the pb requires rather than a location that means
@@ -187,6 +208,50 @@ def _website(rec: List[Any]) -> Optional[str]:
     return node if isinstance(node, str) else None
 
 
+def _dig(node: Any, *path: int) -> Any:
+    """node[a][b][c], or None as soon as a step is missing."""
+    for i in path:
+        if not isinstance(node, list) or len(node) <= i:
+            return None
+        node = node[i]
+    return node
+
+
+def _status(rec: List[Any]) -> Optional[str]:
+    """The listing's status line -- "Permanently closed", "Temporarily closed",
+    "Open ⋅ Closes 6 pm". Two places carry it; the first with text wins."""
+    for path in ((34, 4, 4), (88, 0)):
+        value = _dig(rec, *path)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _hours(rec: List[Any]) -> Optional[Dict[str, List[str]]]:
+    """{"Monday": ["9 am–5 pm"], ...} from either of the two places Google puts
+    the week. None when neither holds one."""
+    items = _dig(rec, 203, 0)
+    if not isinstance(items, list) or not items:
+        items = _dig(rec, 34, 1)
+    if not isinstance(items, list):
+        return None
+    week: Dict[str, List[str]] = {}
+    for item in items:
+        day, slots = _dig(item, 0), _dig(item, 3)
+        if not isinstance(day, str) or not day or not isinstance(slots, list):
+            continue
+        times = [slot[0] for slot in slots
+                 if isinstance(slot, list) and slot and isinstance(slot[0], str) and slot[0]]
+        if times:
+            week[day] = times
+    return week or None
+
+
+def _count(value: Any) -> Optional[int]:
+    n = _num(value)
+    return int(n) if n is not None and n >= 0 and not isinstance(value, bool) else None
+
+
 def _business(rec: List[Any], place_label: str) -> Optional[Business]:
     cid = _at(rec, "cid")
     name = _at(rec, "name")
@@ -196,9 +261,26 @@ def _business(rec: List[Any], place_label: str) -> Optional[Business]:
     cats = _at(rec, "categories")
     coords = _at(rec, "coords") or []
     rating_node = _at(rec, "rating")
-    rating = None
+    rating = review_count = None
     if isinstance(rating_node, list) and len(rating_node) > RATING_AT:
         rating = _num(rating_node[RATING_AT])
+    if isinstance(rating_node, list) and len(rating_node) > COUNT_AT:
+        review_count = _count(rating_node[COUNT_AT])
+
+    extras: Dict[str, Any] = {
+        "categories": cats if isinstance(cats, list) else [],
+        "maps_url": "https://www.google.com/maps?cid=%s" % _decimal_cid(cid)}
+    price = _dig(rec, 4, 2)
+    if isinstance(price, str) and price:
+        extras["price_range"] = price
+    per_star = _dig(rec, 175, 3)
+    if isinstance(per_star, list) and len(per_star) == 5:
+        stars = [_count(n) for n in per_star]
+        if all(n is not None for n in stars):
+            extras["reviews_per_rating"] = {str(i + 1): n for i, n in enumerate(stars)}
+    about = _dig(rec, 32, 1, 1)
+    if isinstance(about, str) and about:
+        extras["description"] = about
 
     return Business(
         cid=cid,                          # already "0x...:0x...", Kerb's own format
@@ -208,20 +290,52 @@ def _business(rec: List[Any], place_label: str) -> Optional[Business]:
         phone=_phone(rec),
         website=_website(rec),
         rating=rating,
-        # review_count is deliberately absent -- see the module note in
-        # gmaps_source(). Guessing it would be worse than leaving it unknown,
-        # because a wrong count silently changes every score.
-        review_count=None,
+        # Only what Google sent. Under the basic template there is no count,
+        # and it stays None -- a guessed count silently changes every score.
+        review_count=review_count,
         lat=_num(coords[2]) if len(coords) > 2 else None,
         lng=_num(coords[3]) if len(coords) > 3 else None,
-        hours=None,
+        hours=_hours(rec),
+        # "Permanently closed" here is what liveness reads. Before this was
+        # parsed, a closed business found on Google Maps was judged open.
+        status_raw=_status(rec),
         source="gmaps",
         place_label=place_label,
         # Nothing is discarded: a field ignored today is a signal someone writes
         # next month, and re-collecting to recover it costs far more.
-        extras={"categories": cats if isinstance(cats, list) else [],
-                "maps_url": "https://www.google.com/maps?cid=%s" % _decimal_cid(cid)},
+        extras=extras,
     )
+
+
+def field_tally(found: List[Business]) -> Dict[str, int]:
+    """How many of these records carried each optional field."""
+    return {"records": len(found),
+            "review_count": sum(b.review_count is not None for b in found),
+            "status": sum(b.status_raw is not None for b in found),
+            "hours": sum(b.hours is not None for b in found)}
+
+
+def probe_fields(client, hl: str = "en", gl: str = "us") -> Optional[Dict[str, int]]:
+    """One real search with the full template, to learn which optional fields
+    Google sends this profile. If Google refuses the full template, the basic
+    one is asked instead -- what it brings is what a run will get. None when no
+    answer could be read -- a block, a consent page, a network error -- which
+    says nothing either way."""
+    for template in (PB_FULL, PB_BASIC):
+        params = {"tbm": "map", "authuser": "0", "hl": hl, "gl": gl,
+                  "q": "restaurant London",
+                  "pb": template.format(span=_span(10), lat=CENTRE[0], lng=CENTRE[1],
+                                        take=PAGE, skip=0)}
+        try:
+            r = client.get(ENDPOINT, params=params)
+            if r.status_code != 200:
+                return None
+            return field_tally(parse(r.text, "probe"))
+        except ShapeChanged:
+            continue
+        except Exception:                           # noqa: BLE001
+            return None
+    return None
 
 
 def _decimal_cid(cid: str) -> str:
@@ -302,12 +416,26 @@ def _span(zoom_km: float) -> int:
     return max(500, int(zoom_km * 1000))
 
 
+def _unmeasurable() -> tuple:
+    """What a Google Maps run cannot supply, going by what Google has actually
+    been seen to send this profile.
+
+    Review counts arrive only under the full template, and only if Google
+    honours it. Until a setup check or a run has SEEN counts, `reviews` is
+    declared unmeasurable -- so the UI warns before a run instead of every
+    business landing in "never found out" after it. Velocity and first-review
+    year need review dates, which no search result carries.
+    """
+    derived = ("review_velocity", "establishment_age")
+    if Profile.load().fields.get("review_count"):
+        return derived
+    return ("reviews",) + derived
+
+
 @source(id="gmaps", label="Google Maps",
         description="Collected by Kerb itself -- no key, no browser, no scraper",
-        # Everything built on the review count: the collector never has one
-        # (see gmaps_source), signed in or not.
         takes="places",
-        cannot_measure=("reviews", "review_velocity", "establishment_age"),
+        cannot_measure=_unmeasurable,
         instead={"reviews": "rating_band"},
         legal_note="Reads public business listings the way the Maps site does. "
                    "This is against Google's Terms of Service, and the endpoint "
@@ -316,13 +444,13 @@ def _span(zoom_km: float) -> int:
 def gmaps_source(q: SourceQuery) -> Iterator[Business]:
     """Search each place for the trade, page through, yield businesses.
 
-    KNOWN GAP -- review counts. The endpoint returns them only for a `pb`
-    template that has not been worked out yet, so `review_count` arrives as
-    None and the `reviews` condition will report those businesses as
-    UNEVALUATED rather than rejecting them. That is the correct behaviour for a
-    measurement Kerb could not take, and it is why it is not faked. Two ways
-    forward: turn the review-count condition off for gmaps runs, or supply a
-    better template with `options.pb`.
+    Review counts, closure status and opening hours come from the FULL
+    template (`fields: full`, the default). If Google answers it with a shape
+    Kerb cannot read, the run falls back to the basic template by itself and
+    says so; the counts are then None, and a `reviews` condition reports those
+    businesses as never found out -- never as rejected, and never guessed.
+    What arrived is remembered in the profile, so the UI can warn about what is
+    really missing before the next run.
     """
     if not q.what:
         raise ValueError("the gmaps source searches by trade. Name one "
@@ -355,7 +483,16 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
     zoom_km = float(q.options.get("zoom_km", 10))
     retries = int(q.options.get("retries", RETRIES))
     backoff = float(q.options.get("backoff", BACKOFF))
-    template = str(q.options.get("pb") or PB_TEMPLATE)
+    explicit_pb = q.options.get("pb")
+    fields = str(q.options.get("fields") or "full").lower()
+    if not explicit_pb and fields not in TEMPLATES:
+        raise ValueError("options.fields must be one of %s, not %r"
+                         % (", ".join(sorted(TEMPLATES)), fields))
+    # Shared by the workers: the first to find the full template refused
+    # switches everyone to the basic one, once.
+    tmpl = {"pb": str(explicit_pb or TEMPLATES[fields]),
+            "can_fall_back": not explicit_pb and fields == "full"}
+    seen = {"records": 0, "review_count": 0, "status": 0, "hours": 0}
     hl = str(q.options.get("hl") or prof.locale.get("hl", "en"))
     gl = str(q.options.get("gl") or prof.locale.get("gl", "us"))
 
@@ -406,14 +543,36 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
                 if stop.is_set():
                     return
                 limiter.acquire()
-                pb = template.format(span=_span(zoom_km), lat=lat, lng=lng,
-                                     take=PAGE, skip=page * PAGE)
-                raw = _request(client, {"tbm": "map", "authuser": "0",
-                                        "hl": hl, "gl": gl,
-                                        "q": "%s %s" % (q.what, place),
-                                        "pb": pb},
-                               retries, backoff, tally=q.report, lock=lock)
-                found = parse(raw, place)
+                used = tmpl["pb"]
+
+                def ask(template):
+                    pb = template.format(span=_span(zoom_km), lat=lat, lng=lng,
+                                         take=PAGE, skip=page * PAGE)
+                    return _request(client, {"tbm": "map", "authuser": "0",
+                                             "hl": hl, "gl": gl,
+                                             "q": "%s %s" % (q.what, place),
+                                             "pb": pb},
+                                    retries, backoff, tally=q.report, lock=lock)
+
+                raw = ask(used)
+                try:
+                    found = parse(raw, place)
+                except ShapeChanged:
+                    if not (tmpl["can_fall_back"] and used == PB_FULL):
+                        raise
+                    with lock:
+                        if tmpl["pb"] == PB_FULL:
+                            tmpl["pb"] = PB_BASIC
+                            q.report.setdefault("notes", []).append(
+                                "Google did not accept the full field set, so this "
+                                "run fell back to the basic one: no review counts, "
+                                "closure status or opening hours.")
+                    limiter.acquire()
+                    found = parse(ask(PB_BASIC), place)   # a shape change now is real
+                tally = field_tally(found)
+                with lock:
+                    for k in seen:
+                        seen[k] += tally[k]
                 for biz in found:
                     if stop.is_set():
                         return
@@ -461,18 +620,37 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
     counter = [0]
     places = list(q.places)
 
+    def remember_fields() -> None:
+        """Record what arrived, so the UI warns about what is really missing.
+        A run that fell back is recorded too -- Google refusing the full set is
+        exactly "no counts". A custom `pb` or an explicit `fields: basic` says
+        nothing about what Google would send, and is skipped."""
+        if not seen["records"]:
+            return
+        if tmpl["pb"] == PB_FULL and not seen["review_count"]:
+            q.report.setdefault("notes", []).append(
+                "Google sent no review counts this run, so conditions on "
+                "`reviews` could not be judged -- use rating_band, or add "
+                "reviews_live.")
+        if tmpl["can_fall_back"] and prof.exists:
+            prof.record_fields(seen, seen["records"])
+            prof.save()
+
     if workers == 1:
         # The simple path stays simple: no threads, no queue, easiest to debug.
-        with httpx.Client(follow_redirects=True,
-                          timeout=httpx.Timeout(30.0, connect=10.0),
-                          headers=prof.headers(), cookies=prof.cookies) as client:
-            for place in places:
-                one_place(client, place, out, stop, lock, counter)
-                while not out.empty():
-                    yield out.get()
-                if stop.is_set():
-                    return
-                _sleep(pause)
+        try:
+            with httpx.Client(follow_redirects=True,
+                              timeout=httpx.Timeout(30.0, connect=10.0),
+                              headers=prof.headers(), cookies=prof.cookies) as client:
+                for place in places:
+                    one_place(client, place, out, stop, lock, counter)
+                    while not out.empty():
+                        yield out.get()
+                    if stop.is_set():
+                        return
+                    _sleep(pause)
+        finally:
+            remember_fields()
         prof.record_success()
         return
 
@@ -519,5 +697,6 @@ def gmaps_source(q: SourceQuery) -> Iterator[Business]:
             stop.set()
         for t in threads:
             t.join(timeout=5)
+        remember_fields()
     if not stop.is_set():
         prof.record_success()

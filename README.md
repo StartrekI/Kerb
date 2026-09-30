@@ -9,8 +9,8 @@ It runs the checks you choose and sorts every business into **qualified**, **rej
 **never found out**, which is what it reports when it could not take a measurement.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-000000.svg)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-244%20passing-2C6A4F.svg)](tests/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/downloads/)
+[![Tests](https://img.shields.io/badge/tests-258%20passing-2C6A4F.svg)](tests/)
 [![Core dependencies](https://img.shields.io/badge/core%20dependencies-2-8A5E23.svg)](pyproject.toml)
 [![Self-hosted](https://img.shields.io/badge/runs-on%20your%20machine-19C9E6.svg)](#legal-and-responsible-use)
 
@@ -84,9 +84,11 @@ tell you it doesn't know than quietly make something up.
     recognised automatically.
   - OpenStreetMap: free, openly licensed data under the ODbL, and the default source.
   - Google Maps: no API key needed, but read [Legal](#legal-and-responsible-use) first.
-- **15 signals in three cost tiers.**
+- **18 signals in three cost tiers.**
   - Free signals read the data already in hand.
-  - Cheap signals fetch the business's website; expensive ones open a browser.
+  - Cheap signals fetch the business's website once: is it live, secure,
+    mobile-friendly, recently updated, and what email and social profiles does it
+    publish? Expensive ones open a browser.
   - Paid tiers run only when your campaign names them, and only for businesses that
     passed every cheaper condition.
 - **Evidence on every measurement.** Each one records a value, a confidence from 0 to 1,
@@ -115,7 +117,7 @@ tell you it doesn't know than quietly make something up.
 
 ## Install
 
-Kerb needs **Python 3.9 or newer**.
+Kerb needs **Python 3.10 or newer**.
 
 > **Install from GitHub, not PyPI.** The `kerb` package on PyPI is an unrelated project.
 
@@ -127,12 +129,12 @@ kerb doctor
 ```
 kerb doctor v0.1.0
 
-  ok   python                     3.11.15 (need 3.9+)
+  ok   python                     3.11.15 (need 3.10+)
   ok   yaml                       6.0.3
   ok   httpx                      0.28.1
   ok   web UI                     fastapi, uvicorn, pydantic
   ok   packs                      14 loaded
-  ok   signals                    15 registered
+  ok   signals                    18 registered
   ok   sources                    csv, gmaps, overpass
   --   google maps profile        not set up -- run `kerb setup` (only needed for the gmaps source)
   ok   no leftover processes      clean
@@ -299,11 +301,13 @@ complete answer, and it is listed separately as an empty place.
 |---|---|---|---|---|
 | **Import a file** | `csv` | `options.path` | Whatever your export carries | Depends on the file |
 | **OpenStreetMap** *(default)* | `overpass` | places | Name, category, address, phone, website, opening hours, coordinates | `reviews`, `review_velocity`, `establishment_age`, `reviews_live` |
-| **Google Maps** | `gmaps` | places | Name, category, address, phone, website, rating, coordinates, Google CID | `reviews`, `review_velocity`, `establishment_age` |
+| **Google Maps** | `gmaps` | places | Name, category, address, phone, website, rating, review count, closure status, opening hours, price range, coordinates, Google CID | `review_velocity`, `establishment_age`; `reviews` until Google has been seen sending counts |
 
 The UI knows what each source cannot measure. If a condition asks for one of those
 signals, it warns you and holds the run rather than sending every business to *never
-found out*. For Google Maps it offers `rating_band` in place of `reviews` with one click.
+found out*. For Google Maps the answer comes from what Google has actually sent your
+profile (see below), and the UI offers `rating_band` in place of `reviews` with one click
+while counts are unavailable.
 
 ### Importing a file
 
@@ -366,18 +370,33 @@ than forty places into a run.
 
 ```bash
 kerb setup --gl uk        # --gl decides which Google you get: uk and us return different businesses
-kerb setup --check        # is it working? am I in a cooldown?
+kerb setup --check        # is it working? am I in a cooldown? which fields does Google send?
 ```
 
-**Review counts are not collected by this source**, signed in or not: the endpoint only
-returns them for a request template that hasn't been worked out yet. Kerb leaves the count
-empty rather than guessing, because a guessed count silently changes every score. So, on
-Google Maps:
+**Review counts, closure status and opening hours.** Kerb asks Google for the same field
+set the Maps website asks for (`fields: full`, the default). Each listing then carries
+its review count, its status ("Permanently closed", "Temporarily closed", "Open ⋅ Closes
+6 pm") and its weekly hours, so `reviews` conditions work and closed businesses are
+rejected by `liveness`. The per-star breakdown, price range and description are kept in
+each result's `extras`.
 
-- filter and rank on **`rating_band`**, which *is* collected;
-- or add **`reviews_live`** (expensive tier), which reads the count from each surviving
-  business's Maps page. It needs the `browser` extra and a signed-in profile;
-- or import an export that already has counts.
+Google decides what it sends, so Kerb checks rather than assumes:
+
+- If Google answers the full field set with a shape Kerb can't read, the run falls back
+  to the basic field set by itself and says so in the run's notes.
+- `kerb setup` and every Google Maps run record which fields actually arrived, and
+  `kerb setup --check` shows it:
+
+  ```
+  Google returns: review counts yes, closure status yes, opening hours yes (seen 2m ago)
+  ```
+- Until counts have been seen, the UI treats `reviews` as unmeasurable for Google Maps
+  and offers `rating_band` instead. Kerb never guesses a count, because a guessed count
+  silently changes every score.
+
+If counts are unavailable, filter on **`rating_band`**, or add **`reviews_live`**
+(expensive tier), which reads the count from each surviving business's Maps page and
+needs the `browser` extra and a signed-in profile.
 
 **Signing in** matters for review data: `reviews_live` and `kerb reviews`. Google serves
 signed-out visitors a Maps page with no Reviews tab. Kerb never asks for a password and
@@ -415,6 +434,7 @@ cookie **names** only: a cookie value is a credential and does not belong in a t
 | `workers` | `1` | Places collected in parallel (max 32). The shared limiter still sets the pace |
 | `max_pages` | `5` | Result pages per place, 20 listings each |
 | `hl` / `gl` | from the profile | Interface language and region |
+| `fields` | `full` | `full` asks for review counts, status and hours (falling back by itself if refused); `basic` asks for the rating only |
 | `geocode` | `false` | Geocode places for a tighter viewport. Measured to make no difference to results |
 | `retries` / `backoff` | `4` / `2.0` | Retries on timeouts and 5xx. A 429 or block page is **never** retried |
 
@@ -425,7 +445,7 @@ it. It never returns an empty list that looks like "no businesses here".
 
 ## Signals
 
-Fifteen signals, in three cost tiers:
+Eighteen signals, in three cost tiers:
 - **Free** signals always run, because they read data already in hand.
 - **Cheap** and **expensive** signals run only if your campaign names them, in a filter,
   a weight or `gating`. Kerb never spends requests on your behalf.
@@ -445,11 +465,17 @@ Fifteen signals, in three cost tiers:
 | `name_script` | free | The dominant writing system of the name | `latin`, `cyrillic`, `greek`, `arabic`, `hebrew`, `devanagari`, `han`, `hiragana`, `katakana`, `hangul`, `thai`, `tamil`, `bengali`, `telugu`, `unknown` |
 | `site_status` | **cheap** | Does the website actually load? | `live`, `dead`, `parked`, `placeholder`, `no_site`, `unknown` |
 | `site_platform` | **cheap** | What is it built on, read from the HTML? | `wix`, `squarespace`, `shopify`, `wordpress`, `godaddy`, `weebly`, `webflow`, `duda`, `square`, `facebook`, `custom`, `unknown` |
-| `site_contact` | **cheap** | Contact details found on the site | text |
+| `site_contact` | **cheap** | An email published on the site, read from a contact or imprint page if the home page has none. Its evidence adds social profiles, phone links and whether the email's domain can receive mail | text |
+| `site_https` | **cheap** | Does the site end up on HTTPS, or do browsers mark it "Not secure"? | `true` / `false` |
+| `site_mobile` | **cheap** | Does the page declare a mobile viewport, or shrink a desktop page onto phones? | `true` / `false` |
+| `site_year` | **cheap** | The latest year in the site's copyright notice: when it was last looked after | year (not rankable) |
 | `reviews_live` | **expensive** | The review count, read from the Maps page (needs `kerb[browser]`) | number |
 
 Cheap signals share one fetch per website, respect `robots.txt`, and count every request
-against `limits.max_requests`. See [Staying polite](#staying-polite-and-unblocked).
+against `limits.max_requests`. `site_contact` makes at most one more request, for a
+contact page, and only when the home page has no email. `site_platform`'s evidence names
+the software version the page declares (for example "WordPress 5.2.3"). See
+[Staying polite](#staying-polite-and-unblocked).
 
 ---
 
@@ -635,6 +661,7 @@ kerb reviews 88c16e73a314                      # qualified businesses only
 kerb reviews 88c16e73a314 --max-reviews 200    # cap per business
 kerb reviews 88c16e73a314 --limit 20           # only the first 20 businesses
 kerb reviews 88c16e73a314 --all                # every business in the run
+kerb reviews 88c16e73a314 --workers 8          # businesses in parallel (default 4, max 16)
 ```
 
 Output is JSONL (`reviews-<run>.jsonl` by default), one review per line:
@@ -658,6 +685,23 @@ it. Measured over 100 businesses and 15,821 reviews:
 |---|---|
 | Navigate to each business, then harvest | 12m 21s (7.4s each) |
 | **One capture, swap the id** | **2m 08s (1.28s each), ~124 reviews/second** |
+
+**Workers.** `--workers N` businesses are harvested at once. Each worker takes the next
+business the moment it finishes one, and each business is written to the output file as
+soon as it completes, so a stopped harvest keeps everything already done. Measured in
+headless Chromium against a local stand-in for Google that answers each page in about
+220 ms:
+
+| Businesses (reviews) | 4 workers | 8 workers |
+|---|---|---|
+| 20 (2,903) | 28 s | 21 s |
+| 100 (14,465) | 133 s | 99 s |
+
+A business's own pages still come one after another, because each page carries the
+cursor for the next. So the business with the most reviews sets the minimum time, and
+more workers stop helping beyond that. If Google answers with a 429, every worker stops
+taking new businesses, the harvest ends with what it has, and it says so. Kerb doesn't
+retry faster or around it.
 
 One browser is opened per command, tagged, and closed when the command finishes;
 `kerb stop` finds and closes it too. Review text includes **reviewers' names and words**,
@@ -726,8 +770,8 @@ exports in about four seconds.
 | `kerb estimate CAMPAIGN` | What a campaign would do and spend, without doing it |
 | `kerb requalify RUN_ID [-c CAMPAIGN] [--apply]` | Re-judges a stored run with today's rules, no refetch |
 | `kerb jobs [RUN_ID]` | Durable runs: what finished, what is left |
-| `kerb setup [--gl GL] [--hl HL] [--check] [--import-cookies FILE]` | Builds or checks the Google Maps profile |
-| `kerb reviews RUN_ID [--max-reviews N] [--limit N] [--all] [--out FILE]` | Harvests review text for a finished run (needs `kerb[browser]`) |
+| `kerb setup [--gl GL] [--hl HL] [--check] [--import-cookies FILE]` | Builds or checks the Google Maps profile, and reports which fields Google sends it |
+| `kerb reviews RUN_ID [--workers N] [--max-reviews N] [--limit N] [--all] [--out FILE]` | Harvests review text for a finished run (needs `kerb[browser]`) |
 | `kerb doctor` | Checks the install, the profile and stray processes |
 | `kerb stop [-n]` | Stops everything Kerb started and verifies it; `-n` only lists |
 
@@ -801,8 +845,9 @@ Kerb is polite by construction, because the alternative is an address that stops
 
 Every project has these; here are Kerb's.
 
-- **Google Maps review counts are not collected.** See [Google Maps](#google-maps) for the
-  three ways around it.
+- **Google Maps fields are Google's choice.** Review counts, closure status and hours
+  arrive only while Google honours the full field set. Kerb falls back by itself, and
+  `kerb setup --check` shows what is arriving; see [Google Maps](#google-maps).
 - **The Google Maps endpoint is undocumented** and may change without notice. Kerb fails
   loudly (`ShapeChanged`) rather than returning nothing, but a change still needs a fix.
 - **OpenStreetMap coverage varies** by country and trade, and OSM carries no ratings or
@@ -829,13 +874,14 @@ kerb/
 ├── store.py          SQLite ledger: runs, results, durable work queue
 ├── collect.py        durable collection: leases, retries, rate limiting
 ├── fetch.py          polite website fetcher: robots.txt, per-host limits, cache
+├── dns.py            "can this email's domain receive mail?" (MX lookup, stdlib only)
 ├── suppress.py       hard and soft suppression
 ├── health.py         failure-rate breaker, discovery health
 ├── session.py        Google Maps browsing profile and cooldown
 ├── reviews.py        review harvesting (opt-in, browser)
 ├── procs.py          registry of browser processes Kerb started
 ├── sources/          csv_ingest · overpass · gmaps · durable
-├── signals/          the 15 signals, one decorator each
+├── signals/          the 18 signals, one decorator each
 ├── packs/data/       trades · geo · chains · web-presence (YAML)
 └── static/           index.html (the whole UI) · _smoke.html (UI test harness)
 examples/             runnable campaigns
@@ -852,13 +898,13 @@ Contributions are welcome. Issues and pull requests go to
 ```bash
 git clone https://github.com/StartrekI/Kerb && cd Kerb
 pip install -e ".[server,dev]"
-python3 -m pytest -q          # 244 tests, all offline
+python3 -m pytest -q          # 258 tests, all offline
 ```
 
 - **Tests are offline by design.** One runs against a *real* captured Maps response
   trimmed to a fixture, so a shape change breaks a test rather than a user's afternoon.
   The UI's YAML round-trip test runs through Node when it is installed and is skipped
-  otherwise.
+  otherwise. GitHub Actions runs the suite on Python 3.10 to 3.13 for every pull request.
 - **The UI has its own harness.** With `kerb serve` running, open
   `/assets/_smoke.html?w=1500&h=1250&theme=dark` to drive the real page through 67
   checks. [FRONTEND-REQUIREMENTS.md](FRONTEND-REQUIREMENTS.md) is the UI's contract.

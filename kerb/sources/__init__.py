@@ -20,7 +20,7 @@ A source yields Business records. Nothing else is required of it.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterator, List
+from typing import Any, Callable, Dict, Iterator, List
 
 from ..models import Business, SourceQuery
 
@@ -40,8 +40,10 @@ class RegisteredSource:
     takes: str = "places"          # "path" | "places"
     # Signals this source structurally cannot supply. Declared here so the UI
     # can warn BEFORE a run instead of the user reading a screen of
-    # "unevaluated" afterwards and assuming Kerb is broken.
-    cannot_measure: tuple = ()
+    # "unevaluated" afterwards and assuming Kerb is broken. A tuple, or a
+    # function returning one when the answer depends on what the service has
+    # been seen to send -- read it through unmeasurable().
+    cannot_measure: Any = ()
     # What to use instead, when the source cannot supply something. Lets the UI
     # offer a way forward rather than only a refusal.
     instead: dict = None
@@ -50,6 +52,11 @@ class RegisteredSource:
     # name for every keyed source, belonging to a source that does not exist.
     key_env: str = ""
 
+    def unmeasurable(self) -> tuple:
+        """What this source cannot supply right now."""
+        c = self.cannot_measure
+        return tuple(c() if callable(c) else c)
+
 
 _SOURCES: Dict[str, RegisteredSource] = {}
 
@@ -57,7 +64,7 @@ _SOURCES: Dict[str, RegisteredSource] = {}
 def source(id: str, label: str = "", description: str = "",
            needs_key: bool = False, needs_browser: bool = False,
            legal_note: str = "", takes: str = "places",
-           cannot_measure: tuple = (), instead: dict = None,
+           cannot_measure: Any = (), instead: dict = None,
            key_env: str = ""):
     def wrap(fn):
         _SOURCES[id] = RegisteredSource(
@@ -65,7 +72,9 @@ def source(id: str, label: str = "", description: str = "",
             description=description or (fn.__doc__ or "").strip().split("\n")[0],
             needs_key=needs_key, needs_browser=needs_browser,
             legal_note=legal_note, takes=takes,
-            cannot_measure=tuple(cannot_measure), instead=dict(instead or {}),
+            cannot_measure=(cannot_measure if callable(cannot_measure)
+                            else tuple(cannot_measure)),
+            instead=dict(instead or {}),
             key_env=key_env)
         return fn
     return wrap
